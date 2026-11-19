@@ -17,7 +17,9 @@ mod icons;
 mod mf;
 mod overlay;
 mod platform;
+mod prefs;
 mod record;
+mod updater;
 mod util;
 
 use arboard::{Clipboard, ImageData};
@@ -27,6 +29,8 @@ use eframe::egui::{self, Color32, Pos2, Rect, Vec2};
 use flyout::{Flyout, FlyoutAction, FlyoutKind};
 use image::{imageops, DynamicImage, Rgba, RgbaImage};
 use overlay::*;
+use platform::{Backdrop, Folder};
+use prefs::UpdateState;
 use record::{RecordTarget, Recorder, RecordingInfo};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -55,6 +59,26 @@ enum CaptureMode {
     FullScreen,
 }
 
+/// How the floating windows look (Settings → Appearance).
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+#[serde(default)]
+struct Look {
+    backdrop: Backdrop,
+    tint: Color32,
+    /// 0..1 — how much of the tint colour is mixed in.
+    tint_strength: f32,
+    /// 0..1 — milky white layer; lower = clearer.
+    frosting: f32,
+    /// 0..1 — dark layer behind the icons.
+    darkness: f32,
+}
+
+impl Default for Look {
+    fn default() -> Self {
+        Self { backdrop: Backdrop::Blur, tint: ACCENT, tint_strength: 0.10, frosting: 0.08, darkness: 0.45 }
+    }
+}
+
 /// Everything remembered between runs.
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
@@ -68,6 +92,15 @@ struct Settings {
     pen_color: Color32,
     highlighter_color: Color32,
     brush_size: f32,
+    /// `None` = default (`Pictures\Screenshots`).
+    screenshot_dir: Option<PathBuf>,
+    /// `None` = default (`Videos\Snippy`).
+    video_dir: Option<PathBuf>,
+    auto_save: bool,
+    fps: u32,
+    show_cursor: bool,
+    look: Look,
+    check_updates: bool,
 }
 
 impl Default for Settings {
@@ -82,6 +115,13 @@ impl Default for Settings {
             pen_color: Color32::from_rgb(230, 40, 40),
             highlighter_color: Color32::from_rgba_unmultiplied(255, 235, 50, 110),
             brush_size: 4.0,
+            screenshot_dir: None,
+            video_dir: None,
+            auto_save: true,
+            fps: RECORD_FPS,
+            show_cursor: true,
+            look: Look::default(),
+            check_updates: true,
         }
     }
 }
@@ -102,19 +142,31 @@ struct SnippyApp {
     editor: Option<Editor>,
     clipboard: Option<Clipboard>,
     flyout: Option<Flyout>,
-    /// Acrylic backdrop active on the main window.
+    /// A glass backdrop is active (our painted layers go on top of it).
     glass: bool,
-    /// Hovered bar tooltip: (text, hover start time, window styled).
-    tip: Option<(String, f64, bool)>,
+    main_hwnd: Option<platform::Hwnd>,
+    /// Bumped when the look changes, so secondary windows re-style themselves.
+    style_gen: u64,
+    /// Hovered bar tooltip: (text, hover start time, style generation applied).
+    tip: Option<(String, f64, Option<u64>)>,
+    settings_open: bool,
+    settings_styled: bool,
+    update: UpdateState,
+    /// Cached "start with Windows" state (reading the registry every frame is wasteful).
+    startup: Option<bool>,
+    prefs_status: String,
 }
 
 impl SnippyApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let settings = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
+        let settings: Settings = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
         // Glass backdrop + rounded corners + hidden from screen capture (so the bar is never
         // in screenshots or recordings).
-        let glass = platform::main_hwnd(cc).is_some_and(|h| platform::style_window(h, true));
-        Self {
+        let main_hwnd = platform::main_hwnd(cc);
+        let glass = main_hwnd.is_some_and(|h| platform::style_window(h, settings.look.backdrop));
+        updater::cleanup_old();
+        platform::refresh_startup_path();
+        let mut app = Self {
             phase: Phase::Bar,
             settings,
             status: "Ready".into(),
@@ -123,8 +175,35 @@ impl SnippyApp {
             clipboard: None,
             flyout: None,
             glass,
+            main_hwnd,
+            style_gen: 0,
             tip: None,
+            settings_open: false,
+            settings_styled: false,
+            update: UpdateState::Idle,
+            startup: None,
+            prefs_status: String::new(),
+        };
+        if app.settings.check_updates {
+            app.check_for_updates(&cc.egui_ctx, false);
         }
+        app
+    }
+
+    /// Re-applies the glass style to every window after it changed in Settings.
+    fn restyle(&mut self) {
+        if let Some(h) = self.main_hwnd {
+            self.glass = platform::style_window(h, self.settings.look.backdrop);
+        }
+        self.style_gen += 1;
+    }
+
+    fn screenshot_dir(&self) -> PathBuf {
+        self.settings.screenshot_dir.clone().unwrap_or_else(|| platform::default_dir(Folder::Pictures))
+    }
+
+    fn video_dir(&self) -> PathBuf {
+        self.settings.video_dir.clone().unwrap_or_else(|| platform::default_dir(Folder::Videos))
     }
 }
 
@@ -242,11 +321,15 @@ impl SnippyApp {
     fn finish_snip(&mut self, ctx: &egui::Context, img: RgbaImage) {
         let anchor = self.flyout_anchor(ctx);
         let copied = self.copy_to_clipboard(&img);
-        let path = platform::output_dir(platform::Folder::Pictures, "Screenshots")
-            .join(format!("Snippy {}.png", timestamp()));
-        let (path, save_err) = match save_image(&img, &path) {
-            Ok(p) => (Some(p), None),
-            Err(e) => (None, Some(e)),
+        let (path, save_err) = if self.settings.auto_save {
+            let dir = self.screenshot_dir();
+            let path = dir.join(format!("Snippy {}.png", timestamp()));
+            match std::fs::create_dir_all(&dir).map_err(|e| e.to_string()).and_then(|()| save_image(&img, &path)) {
+                Ok(p) => (Some(p), None),
+                Err(e) => (None, Some(e)),
+            }
+        } else {
+            (None, None)
         };
         self.flyout = Some(Flyout::snip(ctx, img, path, copied, save_err, anchor));
         self.show_home(ctx);
@@ -270,7 +353,7 @@ impl SnippyApp {
 
     fn handle_flyout(&mut self, ctx: &egui::Context) {
         let Some(f) = self.flyout.as_mut() else { return };
-        let Some(action) = f.show(ctx) else { return };
+        let Some(action) = f.show(ctx, &self.settings.look, self.glass, self.style_gen) else { return };
         match action {
             FlyoutAction::Close => self.flyout = None,
             FlyoutAction::Edit => {
@@ -311,6 +394,21 @@ impl SnippyApp {
                 }
                 self.flyout = None;
             }
+            FlyoutAction::Update => {
+                if let FlyoutKind::Update(rel) = &f.kind {
+                    let rel = rel.clone();
+                    f.flash("Downloading…");
+                    f.hold();
+                    self.start_download(ctx, rel);
+                }
+            }
+            FlyoutAction::ReleaseNotes => {
+                let url = match &f.kind {
+                    FlyoutKind::Update(rel) if !rel.page.is_empty() => rel.page.clone(),
+                    _ => updater::releases_page(),
+                };
+                let _ = open_url(&url);
+            }
         }
     }
 
@@ -336,7 +434,7 @@ impl SnippyApp {
                 let dest = if dest.extension().is_none() { dest.with_extension("mp4") } else { dest };
                 move_file(&info.path, &dest).map(|()| dest).map_err(|e| e.to_string())
             }
-            FlyoutKind::Message => return,
+            FlyoutKind::Update(_) | FlyoutKind::Message => return,
         };
         match result {
             Ok(p) => f.set_path(p),
@@ -361,12 +459,15 @@ impl SnippyApp {
     /// `border`: the recorded area in global points, to outline it on screen (None = full screen).
     fn begin_recording(&mut self, ctx: &egui::Context, target: RecordTarget, border: Option<Rect>) {
         let opts = record::RecordOptions {
-            fps: RECORD_FPS,
+            fps: self.settings.fps.clamp(5, 60),
             countdown: Duration::from_secs(self.settings.delay_secs),
             system_audio: self.settings.system_audio,
             microphone: self.settings.microphone,
+            cursor: self.settings.show_cursor,
         };
-        let path = platform::output_dir(platform::Folder::Videos, "Snippy").join(format!("Recording {}.mp4", timestamp()));
+        let dir = self.video_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("Recording {}.mp4", timestamp()));
         let recorder = Recorder::start(target, opts, path);
         self.phase = Phase::Recording { recorder, border };
 
@@ -403,6 +504,7 @@ impl eframe::App for SnippyApp {
     /// Runs even while the window is hidden, so capture results are handled here
     /// on the UI thread — the worker thread never touches the window.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_updates(ctx);
         let Some(rx) = &self.capture_rx else { return };
         let result = match rx.try_recv() {
             Ok(r) => r,
@@ -449,6 +551,11 @@ impl eframe::App for SnippyApp {
         }
         if !matches!(self.phase, Phase::Capturing | Phase::Overlay(_)) {
             self.handle_flyout(&ctx);
+            if self.settings_open {
+                self.settings_window(&ctx);
+            } else {
+                self.settings_styled = false;
+            }
         }
     }
 }

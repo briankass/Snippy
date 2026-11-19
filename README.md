@@ -27,9 +27,16 @@ executable: no installer, no runtime dependencies.
   encoder, video only.
 
 **Look & feel**
-- Windows 11 acrylic "glass" bar with rounded corners (opaque fallback on Windows 10)
+- Frosted-glass bar with rounded corners; pick the glass style, tint colour, tint strength,
+  frosting and darkness in Settings
 - Snippy's own windows never appear in your screenshots or recordings
-- Settings are remembered between runs
+
+**Settings** (gear icon on the bar)
+- Screenshot and recording folders, auto-save on/off
+- Start with Windows
+- Check for updates: automatically on startup and on demand; one click downloads the new
+  version from GitHub Releases, swaps it in and restarts
+- Recording frame rate (15/30/60), mouse pointer on/off, default audio sources
 
 ## Using it
 
@@ -42,6 +49,7 @@ The floating bar, top to bottom:
 | Camera | Switch between screenshot mode and video mode (red) |
 | Speaker / Mic | *(video mode)* record system audio / microphone |
 | Timer | Delay (snips) or countdown (recordings): 0 → 3 → 5 → 10 s. Right-click resets |
+| Gear | Settings |
 | ✕ | Exit |
 
 In the selection overlay, **Esc** or **right-click** cancels.
@@ -80,6 +88,10 @@ Every push is built and tested on Windows by GitHub Actions. **To publish a rele
 GitHub Release with `snippy.exe` attached. Pushing a `v*` tag manually also works.
 
 ## Notes
+
+- **Glass:** "Frosted blur" (the default) uses a long-standing Windows composition API that
+  keeps working when the bar isn't focused. "Windows 11 backdrop" uses the official API, but
+  Windows only draws it while the window is focused, so a floating bar usually looks solid.
 
 - Audio is captured with WASAPI; "system audio" records the default playback device.
 - The fallback video encoder is Cisco's OpenH264, compiled from source into the executable.

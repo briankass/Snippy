@@ -27,6 +27,19 @@ pub(crate) fn open_path(path: &Path) -> std::io::Result<()> {
     cmd.arg(path).spawn().map(|_| ())
 }
 
+/// Opens a web page in the default browser.
+pub(crate) fn open_url(url: &str) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        // `explorer <url>` hands the URL to the default browser without a console window.
+        std::process::Command::new("explorer").arg(url).spawn().map(|_| ())
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("xdg-open").arg(url).spawn().map(|_| ())
+    }
+}
+
 pub(crate) fn reveal_in_folder(path: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {

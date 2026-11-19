@@ -45,6 +45,8 @@ pub struct RecordOptions {
     pub countdown: Duration,
     pub system_audio: bool,
     pub microphone: bool,
+    /// Draw the mouse pointer into the video.
+    pub cursor: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -258,6 +260,7 @@ fn run(target: RecordTarget, opts: RecordOptions, path: &Path, sh: Arc<Shared>) 
     };
 
     sh.clock.start();
+    let cursor_scale = if opts.cursor { Some(cursor_scale) } else { None };
     let capture_res = capture_loop(&monitor, [rx, ry, rw, rh], (mon_x, mon_y), cursor_scale, fps, &tx, &sh);
     sh.stop.store(true, Ordering::Relaxed); // also stops audio if capture failed
     let end = sh.clock.active().unwrap_or_default();
@@ -399,7 +402,7 @@ fn capture_loop(
     monitor: &Monitor,
     [x, y, w, h]: [u32; 4],
     mon_origin: (i32, i32),
-    cursor_scale: f32,
+    cursor_scale: Option<f32>,
     fps: u32,
     tx: &Sender<Msg>,
     sh: &Shared,
@@ -427,9 +430,9 @@ fn capture_loop(
                         img = imageops::resize(&img, w, h, imageops::FilterType::Triangle);
                     }
                 }
-                if let Some((cx, cy)) = cursor_position() {
+                if let (Some(scale), Some((cx, cy))) = (cursor_scale, cursor_position()) {
                     let (px, py) = (cx - mon_origin.0 - x as i32, cy - mon_origin.1 - y as i32);
-                    draw_cursor(&mut img, px as f32, py as f32, cursor_scale);
+                    draw_cursor(&mut img, px as f32, py as f32, scale);
                 }
                 {
                     let mut thumb = sh.thumbnail.lock().unwrap();

@@ -25,6 +25,7 @@ enum Item {
     Speaker,
     Mic,
     Timer,
+    Settings,
     Close,
     // recording bar
     Status,
@@ -49,7 +50,7 @@ fn bar_items(s: &Settings) -> Vec<Item> {
     if s.record_mode {
         v.extend([Item::Speaker, Item::Mic]);
     }
-    v.extend([Item::Timer, Item::Sep, Item::Close]);
+    v.extend([Item::Timer, Item::Sep, Item::Settings, Item::Close]);
     v
 }
 
@@ -68,16 +69,21 @@ pub(crate) fn rec_bar_size() -> Vec2 {
     size_of(&REC_ITEMS)
 }
 
-/// Background shared by the bars, tooltip and flyout: translucent tint over the acrylic
-/// glass when available, otherwise a nearly opaque dark panel. Thin warm outline.
-pub(crate) fn paint_glass_panel(p: &egui::Painter, rect: Rect, glass: bool, radius: f32) {
-    let fill = if glass {
-        Color32::from_rgba_unmultiplied(22, 22, 26, 120)
+/// Background shared by the bars, tooltip and flyout. Over a glass backdrop it's three
+/// translucent layers (darkness, tint colour, frosting) the user can tune in Settings;
+/// without glass it's a nearly opaque dark panel with a hint of the tint.
+pub(crate) fn paint_glass_panel(p: &egui::Painter, rect: Rect, look: &Look, glass: bool, radius: f32) {
+    let a = |f: f32, max: f32| (f.clamp(0.0, 1.0) * max) as u8;
+    let [tr, tg, tb, _] = look.tint.to_array();
+    if glass {
+        p.rect_filled(rect, radius, Color32::from_black_alpha(a(look.darkness, 235.0)));
+        p.rect_filled(rect, radius, Color32::from_rgba_unmultiplied(tr, tg, tb, a(look.tint_strength, 200.0)));
+        p.rect_filled(rect, radius, Color32::from_white_alpha(a(look.frosting, 120.0)));
     } else {
-        Color32::from_rgba_unmultiplied(32, 32, 36, 248)
-    };
-    p.rect_filled(rect, radius, fill);
-    p.rect_stroke(rect.shrink(0.5), radius, Stroke::new(1.0, ACCENT.gamma_multiply(0.55)), StrokeKind::Inside);
+        p.rect_filled(rect, radius, Color32::from_rgba_unmultiplied(30, 30, 34, 250));
+        p.rect_filled(rect, radius, Color32::from_rgba_unmultiplied(tr, tg, tb, a(look.tint_strength, 50.0)));
+    }
+    p.rect_stroke(rect.shrink(0.5), radius, Stroke::new(1.0, look.tint.gamma_multiply(0.6)), StrokeKind::Inside);
 }
 
 /// Paints a square icon button and returns its response.
@@ -107,13 +113,13 @@ impl SnippyApp {
         let ctx = ui.ctx().clone();
         let capturing = matches!(self.phase, Phase::Capturing);
         let record = self.settings.record_mode;
-        let sel_fill = if record { REC_RED } else { ACCENT };
+        let sel_fill = if record { REC_RED } else { self.settings.look.tint };
         let mut hovered_tip: Option<(String, f32)> = None;
         let mut resize = false;
 
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
             let full = ui.max_rect();
-            paint_glass_panel(ui.painter(), full, self.glass, RADIUS);
+            paint_glass_panel(ui.painter(), full, &self.settings.look, self.glass, RADIUS);
             // Dragging anywhere that isn't a button moves the bar.
             let bg = ui.interact(full, ui.scope_id().with("bar_bg"), Sense::click_and_drag());
             if bg.drag_started() {
@@ -170,11 +176,12 @@ impl SnippyApp {
                         },
                         None,
                     ),
+                    Item::Settings => (Icon::Gear, "Settings".into(), self.settings_open.then_some(Color32::from_white_alpha(30))),
                     Item::Close => (Icon::Close, "Exit Snippy".into(), None),
                     Item::Status | Item::Pause | Item::Stop => continue,
                 };
 
-                let enabled = !capturing || matches!(item, Item::Close);
+                let enabled = !capturing || matches!(item, Item::Close | Item::Settings);
                 let resp = icon_button(ui, id, r, icon, fill, enabled);
                 if item == Item::Timer && self.settings.delay_secs > 0 {
                     // little badge with the seconds
@@ -207,6 +214,7 @@ impl SnippyApp {
                                 _ => 0,
                             }
                         }
+                        Item::Settings => self.settings_open = !self.settings_open,
                         Item::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                         _ => {}
                     }
@@ -243,7 +251,7 @@ impl SnippyApp {
         let mut hovered_tip = None;
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
             let full = ui.max_rect();
-            paint_glass_panel(ui.painter(), full, self.glass, RADIUS);
+            paint_glass_panel(ui.painter(), full, &self.settings.look, self.glass, RADIUS);
             let bg = ui.interact(full, ui.scope_id().with("rec_bg"), Sense::click_and_drag());
             if bg.drag_started() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
@@ -316,7 +324,7 @@ impl SnippyApp {
         let since = match &self.tip {
             Some((t, since, _)) if *t == text => *since,
             _ => {
-                self.tip = Some((text.clone(), now, false));
+                self.tip = Some((text.clone(), now, None));
                 now
             }
         };
@@ -343,15 +351,17 @@ impl SnippyApp {
             .with_taskbar(false)
             .with_resizable(false)
             .with_active(false);
-        let glass = self.glass;
+        let (look, glass) = (self.settings.look, self.glass);
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("snippy_tooltip"), builder, |ui, _| {
             let r = ui.max_rect();
-            paint_glass_panel(ui.painter(), r, glass, 6.0);
+            paint_glass_panel(ui.painter(), r, &look, glass, 6.0);
             ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, &text, font.clone(), Color32::WHITE);
         });
+        let gen = self.style_gen;
+        let backdrop = self.settings.look.backdrop;
         if let Some((_, _, styled)) = &mut self.tip {
-            if !*styled {
-                *styled = style_child_window(TOOLTIP_TITLE, true).is_some();
+            if *styled != Some(gen) && style_child_window(TOOLTIP_TITLE, backdrop).is_some() {
+                *styled = Some(gen);
             }
         }
     }
@@ -398,6 +408,6 @@ pub(crate) fn show_recording_border(ctx: &egui::Context, area: Rect, paused: boo
 
 /// Finds one of our secondary windows by title and applies the glass/rounded/capture-excluded
 /// style. Returns whether glass is active, or `None` if the window wasn't found (yet).
-pub(crate) fn style_child_window(title: &str, glass: bool) -> Option<bool> {
-    platform::find_window(title).map(|h| platform::style_window(h, glass))
+pub(crate) fn style_child_window(title: &str, backdrop: platform::Backdrop) -> Option<bool> {
+    platform::find_window(title).map(|h| platform::style_window(h, backdrop))
 }

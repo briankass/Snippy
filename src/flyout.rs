@@ -16,6 +16,7 @@ const TITLE: &str = "Snippy notification";
 pub(crate) enum FlyoutKind {
     Snip { image: RgbaImage, path: Option<PathBuf> },
     Recording(RecordingInfo),
+    Update(updater::Release),
     Message,
 }
 
@@ -28,6 +29,8 @@ pub(crate) enum FlyoutAction {
     OpenFolder,
     Play,
     Delete,
+    Update,
+    ReleaseNotes,
 }
 
 pub(crate) struct Flyout {
@@ -41,8 +44,7 @@ pub(crate) struct Flyout {
     anchor: Rect,
     lifetime: f64,
     deadline: Option<f64>,
-    styled: bool,
-    glass: bool,
+    styled_gen: Option<u64>,
 }
 
 fn folder_label(path: &Path) -> String {
@@ -60,7 +62,7 @@ impl Flyout {
             None => (None, Vec2::ZERO),
         };
         let lifetime = if notes.is_empty() { 8.0 } else { 15.0 };
-        Self { kind, title, subtitle, notes, thumb, thumb_size, anchor, lifetime, deadline: None, styled: false, glass: false }
+        Self { kind, title, subtitle, notes, thumb, thumb_size, anchor, lifetime, deadline: None, styled_gen: None }
     }
 
     pub(crate) fn snip(ctx: &egui::Context, image: RgbaImage, path: Option<PathBuf>, copied: Result<(), String>, save_err: Option<String>, anchor: Rect) -> Self {
@@ -98,6 +100,15 @@ impl Flyout {
         f
     }
 
+    pub(crate) fn update(rel: updater::Release, anchor: Rect) -> Self {
+        let title = format!("Snippy {} is available", updater::version_string(rel.version));
+        let subtitle = format!("You have {}. Updating takes a few seconds.", updater::version_string(updater::current_version()));
+        let mut f = Self::new(FlyoutKind::Message, title, subtitle, Vec::new(), None, anchor);
+        f.lifetime = 20.0;
+        f.kind = FlyoutKind::Update(rel);
+        f
+    }
+
     pub(crate) fn message(title: impl Into<String>, detail: impl Into<String>, anchor: Rect) -> Self {
         Self::new(FlyoutKind::Message, title.into(), detail.into(), Vec::new(), None, anchor)
     }
@@ -106,7 +117,7 @@ impl Flyout {
         match &self.kind {
             FlyoutKind::Snip { path, .. } => path.as_deref(),
             FlyoutKind::Recording(info) => Some(&info.path),
-            FlyoutKind::Message => None,
+            FlyoutKind::Update(_) | FlyoutKind::Message => None,
         }
     }
 
@@ -115,7 +126,7 @@ impl Flyout {
         match &mut self.kind {
             FlyoutKind::Snip { path, .. } => *path = Some(new),
             FlyoutKind::Recording(info) => info.path = new,
-            FlyoutKind::Message => {}
+            FlyoutKind::Update(_) | FlyoutKind::Message => {}
         }
     }
 
@@ -126,7 +137,13 @@ impl Flyout {
     }
 
     /// Shows the flyout window. Returns an action if a button was clicked.
-    pub(crate) fn show(&mut self, ctx: &egui::Context) -> Option<FlyoutAction> {
+    /// Keep the flyout open (e.g. while an update downloads).
+    pub(crate) fn hold(&mut self) {
+        self.deadline = None;
+        self.lifetime = 3600.0;
+    }
+
+    pub(crate) fn show(&mut self, ctx: &egui::Context, look: &Look, glass: bool, style_gen: u64) -> Option<FlyoutAction> {
         let now = ctx.input(|i| i.time);
         let deadline = *self.deadline.get_or_insert(now + self.lifetime);
         if now > deadline {
@@ -149,11 +166,11 @@ impl Flyout {
 
         let mut action = None;
         let mut hovered = false;
-        let glass = self.glass;
+        let look = *look;
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("snippy_flyout"), builder, |ui, _| {
             let full = ui.max_rect();
             hovered = ui.rect_contains_pointer(full);
-            paint_glass_panel(ui.painter(), full, glass, 10.0);
+            paint_glass_panel(ui.painter(), full, &look, glass, 10.0);
             let p = ui.painter().clone();
 
             // Close (×), top-right
@@ -175,7 +192,7 @@ impl Flyout {
                 let img_r = Rect::from_center_size(boxr.center(), self.thumb_size * scale);
                 p.rect_filled(boxr, 8.0, Color32::from_black_alpha(90));
                 p.image(tex.id(), img_r, unit_uv(), Color32::WHITE);
-                p.rect_stroke(img_r, 4.0, Stroke::new(1.0, ACCENT.gamma_multiply(0.6)), StrokeKind::Outside);
+                p.rect_stroke(img_r, 4.0, Stroke::new(1.0, look.tint.gamma_multiply(0.6)), StrokeKind::Outside);
                 if matches!(self.kind, FlyoutKind::Recording(_)) {
                     p.circle_filled(img_r.center(), 16.0, Color32::from_black_alpha(150));
                     icons::draw(&p, Icon::Play, Rect::from_center_size(img_r.center() + Vec2::new(1.5, 0.0), Vec2::splat(20.0)), Color32::WHITE);
@@ -215,6 +232,10 @@ impl Flyout {
                     (FlyoutAction::Delete, Icon::Trash, "Delete"),
                     (FlyoutAction::OpenFolder, Icon::Folder, ""),
                 ],
+                FlyoutKind::Update(_) => &[
+                    (FlyoutAction::Update, Icon::Refresh, "Update now"),
+                    (FlyoutAction::ReleaseNotes, Icon::Edit, "What's new"),
+                ],
                 FlyoutKind::Message => &[],
             };
             let mut x = text_x;
@@ -228,7 +249,7 @@ impl Flyout {
                 let resp = ui.interact(r, ui.scope_id().with(label).with(icon as u8), Sense::click());
                 let fill = if resp.is_pointer_button_down_on() { 50 } else if resp.hovered() { 34 } else { 16 };
                 p.rect_filled(r, 16.0, Color32::from_white_alpha(fill));
-                p.rect_stroke(r, 16.0, Stroke::new(1.0, ACCENT.gamma_multiply(0.45)), StrokeKind::Inside);
+                p.rect_stroke(r, 16.0, Stroke::new(1.0, look.tint.gamma_multiply(0.45)), StrokeKind::Inside);
                 let icon_r = Rect::from_center_size(Pos2::new(r.min.x + 17.0, r.center().y), Vec2::splat(17.0));
                 let icon_r = if label.is_empty() { Rect::from_center_size(r.center(), Vec2::splat(17.0)) } else { icon_r };
                 icons::draw(&p, icon, icon_r, Color32::WHITE);
@@ -244,11 +265,8 @@ impl Flyout {
         if hovered {
             self.deadline = Some(now + 4.0f64.max(deadline - now));
         }
-        if !self.styled {
-            if let Some(g) = style_child_window(TITLE, true) {
-                self.styled = true;
-                self.glass = g;
-            }
+        if self.styled_gen != Some(style_gen) && style_child_window(TITLE, look.backdrop).is_some() {
+            self.styled_gen = Some(style_gen);
         }
         action
     }
