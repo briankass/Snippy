@@ -6,6 +6,9 @@
 //!                                     └──▶ Editor (full-screen mode skips the overlay)
 //! Record: Bar ──▶ Capturing (hidden) ──▶ Overlay ──▶ Recording (mini bar) ──▶ RecordingDone
 
+mod audio;
+#[cfg(windows)]
+mod mf;
 mod record;
 
 use arboard::{Clipboard, ImageData};
@@ -852,7 +855,8 @@ impl SnippyApp {
     /// `border`: the recorded area in global points, to outline it on screen (None = full screen).
     fn begin_recording(&mut self, ctx: &egui::Context, target: RecordTarget, border: Option<Rect>) {
         let countdown = Duration::from_secs(self.delay_secs);
-        let recorder = Recorder::start(target, RECORD_FPS, countdown, record::default_recording_path());
+        let opts = record::RecordOptions { fps: RECORD_FPS, countdown, system_audio: false, microphone: false };
+        let recorder = Recorder::start(target, opts, record::default_recording_path());
         self.status = "Recording…".into();
         self.phase = Phase::Recording { recorder, border };
 
