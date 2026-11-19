@@ -25,7 +25,9 @@ fn pack(hi: u32, lo: u32) -> u64 {
 }
 
 pub struct MfSink {
-    writer: IMFSinkWriter,
+    /// `Option` so it can be released *before* MFShutdown/CoUninitialize in `Drop`.
+    writer: Option<IMFSinkWriter>,
+    com_initialized: bool,
     video: u32,
     audio: Option<u32>,
     width: u32,
@@ -41,9 +43,17 @@ impl MfSink {
     }
 
     unsafe fn create(path: &Path, width: u32, height: u32, fps: u32, with_audio: bool) -> windows::core::Result<Self> {
-        // S_FALSE (already initialised on this thread) is fine.
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        MFStartup(MF_VERSION, MFSTARTUP_FULL)?;
+        // S_OK / S_FALSE both need a matching CoUninitialize; RPC_E_CHANGED_MODE (thread
+        // already single-threaded) must not be balanced.
+        let com_initialized = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+        if let Err(e) = MFStartup(MF_VERSION, MFSTARTUP_FULL) {
+            if com_initialized {
+                CoUninitialize();
+            }
+            return Err(e);
+        }
+        // From here on, `Drop` (via `guard`) undoes MFStartup/CoInitialize on any error.
+        let mut guard = StartupGuard { com_initialized, armed: true };
 
         let mut attrs: Option<IMFAttributes> = None;
         MFCreateAttributes(&mut attrs, 3)?;
@@ -105,7 +115,8 @@ impl MfSink {
         };
 
         writer.BeginWriting()?;
-        Ok(Self { writer, video, audio, width, height, bgra: Vec::new(), finished: false })
+        guard.armed = false;
+        Ok(Self { writer: Some(writer), com_initialized, video, audio, width, height, bgra: Vec::new(), finished: false })
     }
 
     unsafe fn write(&self, stream: u32, bytes: &[u8], start: Duration, duration: Duration) -> windows::core::Result<()> {
@@ -119,7 +130,7 @@ impl MfSink {
         sample.AddBuffer(&buffer)?;
         sample.SetSampleTime(hns(start))?;
         sample.SetSampleDuration(hns(duration).max(1))?;
-        self.writer.WriteSample(stream, &sample)
+        self.writer.as_ref().expect("writer alive").WriteSample(stream, &sample)
     }
 }
 
@@ -157,18 +168,43 @@ impl MediaSink for MfSink {
 
     fn finish(mut self: Box<Self>) -> Result<(), String> {
         self.finished = true;
-        unsafe { self.writer.Finalize() }.map_err(|e| format!("finalize: {e}"))
+        let w = self.writer.as_ref().expect("writer alive");
+        unsafe { w.Finalize() }.map_err(|e| format!("finalize: {e}"))
     }
 }
 
 impl Drop for MfSink {
     fn drop(&mut self) {
         unsafe {
-            if !self.finished {
-                let _ = self.writer.Finalize();
+            if let Some(w) = self.writer.take() {
+                if !self.finished {
+                    let _ = w.Finalize();
+                }
+                drop(w); // release the COM object while MF/COM are still running
             }
             let _ = MFShutdown();
-            CoUninitialize();
+            if self.com_initialized {
+                CoUninitialize();
+            }
+        }
+    }
+}
+
+/// Undoes MFStartup / CoInitializeEx if `MfSink::create` fails part-way.
+struct StartupGuard {
+    com_initialized: bool,
+    armed: bool,
+}
+
+impl Drop for StartupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            unsafe {
+                let _ = MFShutdown();
+                if self.com_initialized {
+                    CoUninitialize();
+                }
+            }
         }
     }
 }

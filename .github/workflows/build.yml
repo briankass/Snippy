@@ -28,6 +28,20 @@ jobs:
           SNIPPY_MF_TEST_OUT: ${{ runner.temp }}\snippy-mf-test.mp4
         run: cargo test --release -- --nocapture
 
+      # Artifacts can't always be downloaded from automation environments, so also print
+      # the (small) test video as base64 between markers for offline inspection.
+      - name: Print Media Foundation test video (base64)
+        if: always()
+        shell: pwsh
+        run: |
+          $p = "${{ runner.temp }}\snippy-mf-test.mp4"
+          if (Test-Path $p) {
+            Write-Output "MF-VIDEO-BASE64-BEGIN"
+            $b = [Convert]::ToBase64String([IO.File]::ReadAllBytes($p))
+            for ($i = 0; $i -lt $b.Length; $i += 1000) { Write-Output $b.Substring($i, [Math]::Min(1000, $b.Length - $i)) }
+            Write-Output "MF-VIDEO-BASE64-END"
+          } else { Write-Output "no MF test video" }
+
       - name: Upload Media Foundation test video
         if: always()
         uses: actions/upload-artifact@v5
