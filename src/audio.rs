@@ -7,6 +7,8 @@
 //! all tracks a fixed latency behind "now". Gaps become silence, jitter is absorbed, and
 //! audio stays in sync with the video, which uses the same clock.
 
+#![cfg_attr(not(windows), allow(dead_code))] // capture side is Windows-only
+
 use std::collections::VecDeque;
 
 pub const RATE: u32 = 48_000;

@@ -73,6 +73,11 @@ pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
     }
 }
 
+/// Local date-time for file names, e.g. `2026-11-19 17-40-12`.
+pub(crate) fn timestamp() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H-%M-%S").to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

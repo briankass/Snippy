@@ -48,6 +48,7 @@ pub struct RecordOptions {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // some fields are informational (handy for debugging / future UI)
 pub struct RecordingInfo {
     pub path: PathBuf,
     pub width: u32,
@@ -101,6 +102,7 @@ impl Clock {
         Some(now.saturating_duration_since(start).saturating_sub(s.paused_total))
     }
     /// Like [`active`](Self::active) but `None` while paused (used to discard paused audio).
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn running(&self) -> Option<Duration> {
         if self.is_paused() { None } else { self.active() }
     }
@@ -747,18 +749,6 @@ fn seg_dist(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
     (dx * dx + dy * dy).sqrt()
 }
 
-/// Default location for a new recording: `~/Videos/Snippy/Recording <date>.mp4`.
-pub fn default_recording_path() -> PathBuf {
-    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from);
-    let dir = home
-        .map(|h| h.join("Videos"))
-        .filter(|d| d.is_dir())
-        .unwrap_or_else(std::env::temp_dir)
-        .join("Snippy");
-    let _ = std::fs::create_dir_all(&dir);
-    let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S");
-    dir.join(format!("Recording {stamp}.mp4"))
-}
 
 
 #[cfg(test)]

@@ -4,7 +4,7 @@ use super::*;
 //
 // Annotation model, the editor window, and the exporter that burns annotations into the image.
 
-#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize)]
 pub(crate) enum Tool {
     Pen,
     Highlighter,
@@ -107,11 +107,11 @@ impl SnippyApp {
                 ui.separator();
 
                 for (tool, label, key) in Tool::ALL {
-                    ui.selectable_value(&mut self.tool, tool, label).on_hover_text(format!("Shortcut: {key}"));
+                    ui.selectable_value(&mut self.settings.tool, tool, label).on_hover_text(format!("Shortcut: {key}"));
                 }
-                let color = if self.tool == Tool::Highlighter { &mut self.highlighter_color } else { &mut self.pen_color };
+                let color = if self.settings.tool == Tool::Highlighter { &mut self.settings.highlighter_color } else { &mut self.settings.pen_color };
                 ui.color_edit_button_srgba(color);
-                ui.add(egui::Slider::new(&mut self.brush_size, 1.0..=24.0).text("Size"));
+                ui.add(egui::Slider::new(&mut self.settings.brush_size, 1.0..=24.0).text("Size"));
 
                 ui.separator();
                 let Some(ed) = self.editor.as_mut() else { return };
@@ -132,7 +132,7 @@ impl SnippyApp {
                     self.save_final();
                 }
                 ui.separator();
-                if ui.button("⬅ Bar").on_hover_text("Close editor, back to the floating bar").clicked() {
+                if ui.button("✕ Close").on_hover_text("Close the editor").clicked() {
                     self.editor = None;
                     self.show_bar(&ctx);
                 }
@@ -151,7 +151,7 @@ impl SnippyApp {
             });
         });
 
-        let (tool, pen, hl, size) = (self.tool, self.pen_color, self.highlighter_color, self.brush_size);
+        let (tool, pen, hl, size) = (self.settings.tool, self.settings.pen_color, self.settings.highlighter_color, self.settings.brush_size);
         egui::CentralPanel::default().show(ui, |ui| {
             let Some(ed) = self.editor.as_mut() else { return };
             let (img_w, img_h) = (ed.image.width() as f32, ed.image.height() as f32);
@@ -250,7 +250,7 @@ impl SnippyApp {
                 for (tool, _, key) in Tool::ALL {
                     if let Some(k) = Key::from_name(key) {
                         if i.key_pressed(k) && i.modifiers.is_none() {
-                            self.tool = tool;
+                            self.settings.tool = tool;
                         }
                     }
                 }
@@ -389,11 +389,11 @@ mod tests {
     #[test]
     fn highlighter_does_not_accumulate_alpha() {
         let ann = Annotation {
-            pub(crate) tool: Tool::Highlighter,
+            tool: Tool::Highlighter,
             // long, dense, self-overlapping path
-            pub(crate) points: (0..200).map(|i| Pos2::new(10.0 + (i % 50) as f32, 20.0)).collect(),
-            pub(crate) color: Color32::from_rgba_unmultiplied(0, 0, 0, 128),
-            pub(crate) width: 10.0,
+            points: (0..200).map(|i| Pos2::new(10.0 + (i % 50) as f32, 20.0)).collect(),
+            color: Color32::from_rgba_unmultiplied(0, 0, 0, 128),
+            width: 10.0,
         };
         let out = render_annotations(&solid(100, 40), &[ann]);
         let p = out.get_pixel(30, 20);

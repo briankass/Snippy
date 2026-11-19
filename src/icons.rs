@@ -3,7 +3,7 @@
 //! Drawing icons as shapes (instead of emoji/font glyphs) means they never show up as
 //! "tofu" boxes, look identical on every machine, and stay sharp at any display scaling.
 
-use eframe::egui::{epaint::PathShape, Color32, Painter, Pos2, Rect, Shape, Stroke, Vec2};
+use eframe::egui::{Color32, Painter, Pos2, Rect, Shape, Stroke, Vec2};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Icon {
@@ -148,5 +148,4 @@ pub fn draw(p: &Painter, icon: Icon, rect: Rect, color: Color32) {
             closed(&[(6.0, 6.5), (7.0, 20.0), (17.0, 20.0), (18.0, 6.5)]);
         }
     }
-    let _ = PathShape::line; // keep the import meaningful across egui versions
 }

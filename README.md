@@ -2,42 +2,46 @@
 
 A tiny floating screen **snipping** and **recording** tool for Windows, written in Rust.
 
-![bar](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
+![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
 
 ## Download
 
 Grab `snippy.exe` from the [Releases](../../releases) page. It's a single, portable
-executable — no installer, no runtime dependencies.
+executable: no installer, no runtime dependencies.
 
 ## Features
 
 **Screenshots**
-- Region (drag), Window (click to pick, Snipping-Tool style) or Full screen
-- Optional 3 / 5 / 10 s delay
-- Auto-copied to the clipboard
-- Annotate with pen, highlighter, arrow and box; undo / redo
-- Save as PNG or JPEG
+- Region (drag), Window (click to pick) or Full screen, with an optional 3 / 5 / 10 s delay
+- Copied to the clipboard and auto-saved to `Pictures\Screenshots`
+- A flyout in the corner offers **Edit · Copy · Save as · Open folder**
+- Editor: pen, highlighter, arrow and box; undo / redo; save as PNG or JPEG
 
 **Screen recording**
-- Record a region, a window, or the full screen to **MP4 (H.264)**
-- Countdown, pause / resume, and a red outline around the recorded area
-- The Snippy bar itself is hidden from recordings (Windows 10 2004+)
-- Mouse pointer is drawn into the video
-- Saved to `Videos\Snippy\Recording <date>.mp4`
+- Record a region, a window or the full screen to **MP4 (H.264 + AAC)**
+- **System audio** and/or **microphone**, mixed and kept in sync with the video
+- Countdown, pause / resume, red outline around the recorded area, mouse pointer in the video
+- Saved to `Videos\Snippy`; the flyout offers **Play · Save as · Delete · Open folder**
+- Uses Windows' built-in Media Foundation encoders (GPU-accelerated where available). On
+  systems without Media Foundation (Windows "N" editions) it falls back to a software
+  encoder, video only.
 
-Snippy always captures the monitor its floating bar is on.
+**Look & feel**
+- Windows 11 acrylic "glass" bar with rounded corners (opaque fallback on Windows 10)
+- Snippy's own windows never appear in your screenshots or recordings
+- Settings are remembered between runs
 
 ## Using it
 
 The floating bar, top to bottom:
 
-| Control | What it does |
+| Icon | What it does |
 |---|---|
-| ⋮⋮ | Drag to move the bar |
-| ✂ / ⏺ | Take a snip / start a recording |
-| 📷 🎥 | Switch between screenshot and recording |
-| ⬚ 🗔 🖵 | Region / Window / Full screen |
-| ⏱ | Delay (snips) or countdown (recordings). Right-click resets |
+| ⋮⋮ | Drag anywhere on the bar to move it |
+| Region / Window / Full screen | Start a snip (or a recording, in video mode) right away |
+| Camera | Switch between screenshot mode and video mode (red) |
+| Speaker / Mic | *(video mode)* record system audio / microphone |
+| Timer | Delay (snips) or countdown (recordings): 0 → 3 → 5 → 10 s. Right-click resets |
 | ✕ | Exit |
 
 In the selection overlay, **Esc** or **right-click** cancels.
@@ -58,8 +62,8 @@ In the selection overlay, **Esc** or **right-click** cancels.
 cargo build --release
 ```
 
-The binary ends up in `target/release/snippy.exe`. Builds on Windows (MSVC) need nothing
-beyond the Rust toolchain and the Visual Studio C++ build tools.
+The binary ends up in `target/release/snippy.exe`. Building on Windows (MSVC) needs the Rust
+toolchain and the Visual Studio C++ build tools.
 
 Cross-compiling from Linux also works:
 
@@ -69,10 +73,13 @@ rustup target add x86_64-pc-windows-gnu
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 
-Every push to `main` is built and tested by GitHub Actions; pushing a tag like `v0.3.0`
-publishes a release with `snippy.exe` attached.
+## Releases
+
+Every push is built and tested on Windows by GitHub Actions. **To publish a release, bump
+`version` in `Cargo.toml` and push to `main`.** The workflow creates the `vX.Y.Z` tag and a
+GitHub Release with `snippy.exe` attached. Pushing a `v*` tag manually also works.
 
 ## Notes
 
-- No audio is recorded.
-- Recording uses Cisco's OpenH264 encoder, compiled from source into the executable.
+- Audio is captured with WASAPI; "system audio" records the default playback device.
+- The fallback video encoder is Cisco's OpenH264, compiled from source into the executable.

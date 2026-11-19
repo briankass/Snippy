@@ -146,6 +146,10 @@ pub(crate) fn crop_px(img: &RgbaImage, r: Rect) -> Option<RgbaImage> {
 mod tests {
     use super::*;
 
+    fn solid(w: u32, h: u32) -> RgbaImage {
+        RgbaImage::from_pixel(w, h, Rgba([255, 255, 255, 255]))
+    }
+
     #[test]
     fn crop_clamps_to_image() {
         let img = solid(50, 50);
