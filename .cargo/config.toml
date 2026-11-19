@@ -1,0 +1,17 @@
+# Only used when cross-compiling from Linux with MinGW: link the C++ runtime (needed by
+# OpenH264) statically so the .exe has no libstdc++/libgcc/winpthread DLL dependencies.
+# (`cc` would otherwise request a *dynamic* libstdc++, which rustc forces with -Bdynamic.)
+[target.x86_64-pc-windows-gnu]
+rustflags = [
+    "-C", "link-arg=-static", "-C", "link-arg=-static-libgcc",
+    # static libstdc++ goes last on the link line, so re-list the runtime libs it needs after it
+    "-C", "link-arg=-l:libstdc++.a", "-C", "link-arg=-lgcc", "-C", "link-arg=-lgcc_eh",
+    "-C", "link-arg=-lmingw32", "-C", "link-arg=-lmingwex", "-C", "link-arg=-lmsvcrt", "-C", "link-arg=-lkernel32",
+]
+
+[env]
+CXXSTDLIB_x86_64_pc_windows_gnu = ""
+
+# MSVC builds (GitHub Actions): statically link the C runtime so no VC++ redistributable is needed.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

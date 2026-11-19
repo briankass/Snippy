@@ -1,0 +1,29 @@
+[package]
+name = "snippy"
+version = "0.3.0"
+edition = "2021"
+description = "A tiny floating screen snipping and recording tool"
+
+[dependencies]
+eframe = "0.37"
+arboard = "3.7"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+rfd = "0.18"
+xcap = "0.9"
+# H.264 encoder (Cisco OpenH264, compiled from source) + MP4 muxer for screen recording
+openh264 = "0.9"
+mp4 = "0.14"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+] }
+raw-window-handle = "0.6"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
