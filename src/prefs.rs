@@ -192,9 +192,36 @@ impl SnippyApp {
             row(ui, Icon::Keyboard, "Windows + Shift + S opens Snippy", "Replaces the Snipping Tool shortcut, so you can uninstall the Snipping Tool if you like", |ui| {
                 changed |= toggle(ui, &mut self.settings.hotkey_win_shift_s).changed();
             });
+            if cfg!(windows) {
+                // Mirrors the Windows setting itself (read live, written only when toggled).
+                let mut windows_tool = !*self.prtsc_windows.get_or_insert_with(platform::prtsc_opens_snipping_tool);
+                row(ui, Icon::Keyboard, "Stop Windows opening its Snipping Tool on Print Screen",
+                    "Turns off Windows' own \"Use the Print Screen key to open screen capture\" setting, as a backup in case a key press ever slips past Snippy", |ui| {
+                    if toggle(ui, &mut windows_tool).changed() {
+                        match platform::set_prtsc_opens_snipping_tool(!windows_tool) {
+                            Ok(()) => self.prtsc_windows = Some(!windows_tool),
+                            Err(e) => {
+                                self.prtsc_windows = None;
+                                self.prefs_status = e;
+                            }
+                        }
+                    }
+                });
+            }
             row(ui, Icon::Region, "When a shortcut is pressed", "Show the bar to pick what to capture, or start snipping right away", |ui| {
                 ui.selectable_value(&mut self.settings.shortcut_action, ShortcutAction::Snip, "Start a snip");
                 ui.selectable_value(&mut self.settings.shortcut_action, ShortcutAction::ShowBar, "Show the bar");
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(40.0);
+                if ui.link("Open diagnostics log").on_hover_text(diag::path().display().to_string()).clicked() {
+                    let p = diag::path();
+                    if p.exists() {
+                        let _ = reveal_in_folder(&p);
+                    } else {
+                        self.prefs_status = "No diagnostics logged yet (that's good)".into();
+                    }
+                }
             });
             if changed {
                 hotkeys::configure(self.settings.hotkey_print_screen, self.settings.hotkey_win_shift_s);

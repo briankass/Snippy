@@ -71,7 +71,7 @@ mod imp {
     use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
     use windows::Win32::System::Registry::{
-        RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ,
+        RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_DWORD, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
     };
     use windows::Win32::UI::Controls::MARGINS;
     use windows::Win32::UI::Shell::{FOLDERID_Pictures, FOLDERID_Videos, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
@@ -260,6 +260,39 @@ mod imp {
         Ok(())
     }
 
+    // ── Windows' own "Use the Print Screen key to open screen capture" setting
+    //    (HKCU\Control Panel\Keyboard\PrintScreenKeyForSnippingEnabled).
+    const KEYBOARD_KEY: PCWSTR = w!("Control Panel\\Keyboard");
+    const PRTSC_VALUE: PCWSTR = w!("PrintScreenKeyForSnippingEnabled");
+
+    /// Whether Windows opens the Snipping Tool on Print Screen. Absent = Windows' default,
+    /// which is "on" on current Windows 11 builds.
+    pub fn prtsc_opens_snipping_tool() -> bool {
+        unsafe {
+            let mut v: u32 = 1;
+            let mut len = 4u32;
+            let r = RegGetValueW(HKEY_CURRENT_USER, KEYBOARD_KEY, PRTSC_VALUE, RRF_RT_REG_DWORD, None, Some(&mut v as *mut _ as *mut _), Some(&mut len));
+            r != ERROR_SUCCESS || v != 0
+        }
+    }
+
+    pub fn set_prtsc_opens_snipping_tool(on: bool) -> Result<(), String> {
+        let v: u32 = on as u32;
+        let r = unsafe { RegSetKeyValueW(HKEY_CURRENT_USER, KEYBOARD_KEY, PRTSC_VALUE, REG_DWORD.0, Some(&v as *const _ as *const _), 4) };
+        if r != ERROR_SUCCESS {
+            return Err(format!("couldn't change the Windows setting ({})", r.0));
+        }
+        // Tell running apps (Explorer) the keyboard settings changed. Off the UI thread:
+        // a hung window can make the broadcast wait.
+        std::thread::spawn(|| unsafe {
+            use windows::Win32::Foundation::{LPARAM, WPARAM};
+            use windows::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE};
+            let area = w!("Keyboard");
+            SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, WPARAM(0), LPARAM(area.0 as isize), SMTO_ABORTIFHUNG, 1000, None);
+        });
+        Ok(())
+    }
+
     /// If startup is enabled but points at an old location (exe was moved), fix it.
     pub fn refresh_startup_path() {
         if let (Some(cur), Ok(want)) = (read_run_value(), run_command()) {
@@ -306,10 +339,16 @@ mod imp {
         Err("Starting with the OS is only supported on Windows".into())
     }
     pub fn refresh_startup_path() {}
+    pub fn prtsc_opens_snipping_tool() -> bool {
+        false
+    }
+    pub fn set_prtsc_opens_snipping_tool(_on: bool) -> Result<(), String> {
+        Err("Only on Windows".into())
+    }
 }
 
 pub use imp::{
-    find_window, known_folder, move_window, place_hwnd, place_window, refresh_startup_path, set_startup, startup_enabled, style_window,
+    find_window, known_folder, move_window, place_hwnd, place_window, prtsc_opens_snipping_tool, set_prtsc_opens_snipping_tool, refresh_startup_path, set_startup, startup_enabled, style_window,
     window_rect, work_area,
 };
 

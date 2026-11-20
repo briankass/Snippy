@@ -12,8 +12,10 @@
 //!   notifier thread wakes the UI;
 //! * the hook thread runs at the highest priority and the process opts out of power
 //!   throttling;
-//! * a watchdog re-installs the hook every few seconds, so even if Windows drops it,
-//!   shortcuts come back almost immediately.
+//! * raw keyboard input (a separate channel Windows never times out) watches for our keys:
+//!   if raw input sees Print Screen / Win+Shift+S but the hook didn't, the hook was dropped
+//!   and is re-installed on the spot (logged to the diagnostics log);
+//! * a watchdog also re-installs the hook every couple of seconds.
 //!
 //! Limitation (by Windows design): low-level hooks don't see keys while a program running
 //! as administrator has focus.
@@ -92,7 +94,14 @@ pub fn install(ctx: &egui::Context, tx: Sender<AppEvent>) {
 #[cfg(windows)]
 mod imp {
     use super::*;
-    use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
+    use std::sync::atomic::{AtomicIsize, AtomicU32};
+    use windows::core::w;
+    use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::System::SystemInformation::GetTickCount;
+    use windows::Win32::UI::Input::{
+        GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK,
+        RID_INPUT, RIM_TYPEKEYBOARD,
+    };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Threading::{
         GetCurrentProcess, GetCurrentThread, ProcessPowerThrottling, SetProcessInformation, SetThreadPriority,
@@ -104,12 +113,23 @@ mod imp {
         VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT, VK_SNAPSHOT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, DispatchMessageW, GetMessageW, SetTimer, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-        HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN, WM_TIMER,
+        CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW, SetTimer,
+        SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HC_ACTION, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT,
+        LLKHF_INJECTED, MSG, RI_KEY_BREAK, WH_KEYBOARD_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_INPUT, WM_KEYDOWN,
+        WM_SYSKEYDOWN, WM_TIMER, WNDCLASSW,
     };
 
-    /// How often the hook is re-installed, in case Windows silently removed it.
-    const REINSTALL_MS: u32 = 10_000;
+    /// How often the hook is re-installed anyway, in case Windows silently removed it.
+    const REINSTALL_MS: u32 = 2_000;
+    /// If raw input sees one of our keys and the hook hasn't seen it within this long, the
+    /// hook was dropped.
+    const MISS_WINDOW_MS: u32 = 400;
+
+    /// The installed hook (an `HHOOK`), owned by the hook thread.
+    static CURRENT: AtomicIsize = AtomicIsize::new(0);
+    /// `GetTickCount` when the hook last saw one of our keys go down.
+    static HOOK_SAW: AtomicU32 = AtomicU32::new(0);
+    static MODULE: AtomicIsize = AtomicIsize::new(0);
 
     /// True while we're swallowing an `S` press (so its key-up is swallowed too).
     static SWALLOWING_S: AtomicBool = AtomicBool::new(false);
@@ -157,6 +177,9 @@ mod imp {
             let down = wparam.0 as u32 == WM_KEYDOWN || wparam.0 as u32 == WM_SYSKEYDOWN;
             let injected = kb.flags.0 & LLKHF_INJECTED.0 != 0;
             if !injected {
+                if down && (kb.vkCode == VK_SNAPSHOT.0 as u32 || kb.vkCode == b'S' as u32) {
+                    HOOK_SAW.store(GetTickCount(), Ordering::Relaxed);
+                }
                 // Print Screen (plain — Alt+PrtSc etc. keep their Windows behaviour)
                 if kb.vkCode == VK_SNAPSHOT.0 as u32 && PRINT_SCREEN.load(Ordering::Relaxed) {
                     if down && !held(VK_MENU) && !held(VK_CONTROL) && !held(VK_SHIFT) {
@@ -187,29 +210,118 @@ mod imp {
         CallNextHookEx(None, code, wparam, lparam)
     }
 
-    unsafe fn install_hook(module: Option<HINSTANCE>) -> Option<HHOOK> {
-        SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), module, 0).ok()
+    fn module() -> Option<HINSTANCE> {
+        let m = MODULE.load(Ordering::Relaxed);
+        (m != 0).then_some(HINSTANCE(m as *mut _))
+    }
+
+    /// Installs a fresh hook *before* removing the old one, so no key slips through in
+    /// between (the newest hook runs first and swallows ours).
+    unsafe fn reinstall() -> bool {
+        match SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), module(), 0) {
+            Ok(fresh) => {
+                let old = CURRENT.swap(fresh.0 as isize, Ordering::Relaxed);
+                if old != 0 {
+                    let _ = UnhookWindowsHookEx(HHOOK(old as *mut _));
+                }
+                true
+            }
+            Err(e) => {
+                crate::diag::log(&format!("keyboard hook: install failed: {e}"));
+                false
+            }
+        }
+    }
+
+    /// Is `vk` (going down now) one of the shortcuts we're supposed to catch?
+    fn is_our_shortcut(vk: u16) -> bool {
+        (vk == VK_SNAPSHOT.0 && PRINT_SCREEN.load(Ordering::Relaxed) && !held(VK_MENU) && !held(VK_CONTROL) && !held(VK_SHIFT))
+            || (vk == b'S' as u16
+                && WIN_SHIFT_S.load(Ordering::Relaxed)
+                && (held(VK_LWIN) || held(VK_RWIN))
+                && held(VK_SHIFT)
+                && !held(VK_CONTROL)
+                && !held(VK_MENU))
+    }
+
+    /// Raw input watcher: sees every key regardless of hooks. If one of our shortcuts went
+    /// by and the hook didn't see it, Windows dropped the hook: put it back immediately.
+    unsafe extern "system" fn watcher_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if msg == WM_INPUT {
+            let mut raw = RAWINPUT::default();
+            let mut size = std::mem::size_of::<RAWINPUT>() as u32;
+            let got = GetRawInputData(
+                HRAWINPUT(lparam.0 as *mut _),
+                RID_INPUT,
+                Some(&mut raw as *mut _ as *mut _),
+                &mut size,
+                std::mem::size_of::<RAWINPUTHEADER>() as u32,
+            );
+            if got != u32::MAX && raw.header.dwType == RIM_TYPEKEYBOARD.0 {
+                let kb = raw.data.keyboard;
+                let key_down = (kb.Flags as u32 & RI_KEY_BREAK) == 0;
+                if key_down && is_our_shortcut(kb.VKey) {
+                    let since = GetTickCount().wrapping_sub(HOOK_SAW.load(Ordering::Relaxed));
+                    if since > MISS_WINDOW_MS {
+                        let name = if kb.VKey == VK_SNAPSHOT.0 { "Print Screen" } else { "Win+Shift+S" };
+                        let ok = reinstall();
+                        crate::diag::log(&format!(
+                            "keyboard hook missed {name} (Windows had dropped it); re-installed: {}",
+                            if ok { "ok" } else { "FAILED" }
+                        ));
+                    }
+                }
+            }
+        }
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+
+    /// A hidden message-only window registered for raw keyboard input.
+    unsafe fn create_watcher() {
+        let class = w!("SnippyHotkeyWatcher");
+        let wc = WNDCLASSW { lpfnWndProc: Some(watcher_proc), hInstance: module().unwrap_or_default(), lpszClassName: class, ..Default::default() };
+        RegisterClassW(&wc);
+        let Ok(hwnd) = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            class,
+            w!(""),
+            WINDOW_STYLE(0),
+            0,
+            0,
+            0,
+            0,
+            Some(HWND_MESSAGE),
+            None,
+            module(),
+            None,
+        ) else {
+            crate::diag::log("keyboard hook: couldn't create the raw-input watcher window");
+            return;
+        };
+        let dev = RAWINPUTDEVICE { usUsagePage: 0x01, usUsage: 0x06, dwFlags: RIDEV_INPUTSINK, hwndTarget: hwnd };
+        if let Err(e) = RegisterRawInputDevices(&[dev], std::mem::size_of::<RAWINPUTDEVICE>() as u32) {
+            crate::diag::log(&format!("keyboard hook: raw input registration failed: {e}"));
+        }
     }
 
     pub unsafe fn run() {
         // Answer key events promptly even when the system is busy.
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-        let module: Option<HINSTANCE> = GetModuleHandleW(None).ok().map(Into::into);
-        let mut current = install_hook(module);
+        if let Ok(m) = GetModuleHandleW(None) {
+            MODULE.store(m.0 as isize, Ordering::Relaxed);
+        }
+        if reinstall() {
+            crate::diag::log("keyboard hook: installed");
+        }
+        create_watcher();
         // A thread timer (no window): WM_TIMER arrives through this thread's message loop.
         SetTimer(None, 0, REINSTALL_MS, None);
 
         // Low-level hooks are called through this thread's message loop.
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            if msg.message == WM_TIMER {
-                // Install the new hook *before* removing the old one so no key slips
-                // through in between (the newest hook runs first and swallows ours).
-                if let Some(fresh) = install_hook(module) {
-                    if let Some(old) = current.replace(fresh) {
-                        let _ = UnhookWindowsHookEx(old);
-                    }
-                }
+            if msg.message == WM_TIMER && msg.hwnd.0.is_null() {
+                reinstall();
                 continue;
             }
             let _ = TranslateMessage(&msg);

@@ -10,6 +10,7 @@
 mod audio;
 mod bar;
 mod capture;
+mod diag;
 mod editor;
 mod flyout;
 mod hotkeys;
@@ -192,6 +193,8 @@ struct SnippyApp {
     update: UpdateState,
     /// Cached "start with Windows" state (reading the registry every frame is wasteful).
     startup: Option<bool>,
+    /// Cached: does Windows open its Snipping Tool on Print Screen?
+    prtsc_windows: Option<bool>,
     prefs_status: String,
     tray: Option<tray::Tray>,
     /// Where the bar was before a capture took over the main window: (physical pixels,
@@ -235,6 +238,7 @@ impl SnippyApp {
             settings_styled: false,
             update: UpdateState::Idle,
             startup: None,
+            prtsc_windows: None,
             prefs_status: String::new(),
             tray: None,
             last_probe: None,
