@@ -13,12 +13,14 @@ mod capture;
 mod diag;
 mod editor;
 mod flyout;
+mod history;
 mod hotkeys;
 mod icons;
 #[cfg(windows)]
 mod mf;
 mod ocr;
 mod overlay;
+mod pins;
 mod platform;
 mod prefs;
 mod record;
@@ -66,6 +68,10 @@ pub(crate) enum AppEvent {
 enum Purpose {
     Snip,
     Record,
+    /// Copy text from a region (OCR).
+    Ocr,
+    /// Pick a colour from the screen.
+    ColorPick,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize)]
@@ -192,6 +198,13 @@ struct SnippyApp {
     style_gen: u64,
     /// Hovered bar tooltip: (text, hover start time, style generation applied).
     tip: Option<(String, f64, Option<u64>)>,
+    pins: Vec<pins::Pin>,
+    next_pin_id: u64,
+    history: Vec<history::HistoryItem>,
+    history_open: bool,
+    history_ui: history::HistoryUi,
+    /// Text recognition running in the background.
+    ocr_rx: Option<Receiver<Result<String, String>>>,
     settings_open: bool,
     settings_styled: bool,
     update: UpdateState,
@@ -238,6 +251,12 @@ impl SnippyApp {
             main_hwnd,
             style_gen: 0,
             tip: None,
+            pins: Vec::new(),
+            next_pin_id: 0,
+            history: history::load(),
+            history_open: false,
+            history_ui: history::HistoryUi::new(),
+            ocr_rx: None,
             settings_open: false,
             settings_styled: false,
             update: UpdateState::Idle,
@@ -415,6 +434,9 @@ impl SnippyApp {
                     tray::TrayCmd::SnipWindow => snip(self, Some(CaptureMode::Window)),
                     tray::TrayCmd::SnipScreen => snip(self, Some(CaptureMode::FullScreen)),
                     tray::TrayCmd::Record => self.start_capture(ctx, Purpose::Record),
+                    tray::TrayCmd::CopyText => self.start_capture(ctx, Purpose::Ocr),
+                    tray::TrayCmd::PickColor => self.start_capture(ctx, Purpose::ColorPick),
+                    tray::TrayCmd::History => self.history_open = true,
                     tray::TrayCmd::ToggleBar => {
                         if self.bar_revealed {
                             self.bar_revealed = false; // shown by a shortcut: tuck it away again
@@ -560,6 +582,11 @@ impl SnippyApp {
                 Some(img) => self.finish_snip(ctx, img),
                 None => ov.drag = None,
             },
+            Purpose::Ocr => match crop_px(&s.image, px) {
+                Some(img) => self.start_ocr(ctx, img),
+                None => ov.drag = None,
+            },
+            Purpose::ColorPick => {}
             Purpose::Record => {
                 let monitor_id = s.monitor_id;
                 let whole = px.min.distance(full.min) < 1.0 && px.max.distance(full.max) < 1.0;
@@ -644,7 +671,11 @@ impl SnippyApp {
             let points = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min));
             self.saved_pos = Some((phys, points));
         }
-        let mode = self.settings.mode;
+        let mode = match purpose {
+            Purpose::Snip | Purpose::Record => self.settings.mode,
+            // Text and colour always pick from a frozen view of the screen.
+            Purpose::Ocr | Purpose::ColorPick => CaptureMode::Region,
+        };
         // For snips the delay happens before the screenshot; for recordings it's a
         // countdown after you've picked the area.
         let delay = if purpose == Purpose::Snip { self.settings.delay_secs } else { 0 };
@@ -683,6 +714,7 @@ impl SnippyApp {
             (None, None)
         };
         diag::log(&format!("app: snip done (copied={}, saved={}) -> flyout", copied.is_ok(), path.is_some()));
+        self.history_add_snip(&img, path.clone());
         self.flyout = Some(Flyout::snip(ctx, img, path, copied, save_err, anchor));
         self.show_home(ctx);
     }
@@ -765,6 +797,31 @@ impl SnippyApp {
                     self.start_download(ctx, rel);
                 }
             }
+            FlyoutAction::Pin => {
+                if let Some(FlyoutKind::Snip { image, .. }) = self.flyout.as_ref().map(|f| &f.kind) {
+                    let image = image.clone();
+                    self.add_pin(ctx, image);
+                    self.flyout = None;
+                }
+            }
+            FlyoutAction::CopyText => {
+                if let FlyoutKind::Text(t) = &f.kind {
+                    let t = t.clone();
+                    let msg = self.copy_text(&t).map_or_else(|e| format!("Copy failed: {e}"), |()| "Copied again".into());
+                    if let Some(f) = self.flyout.as_mut() {
+                        f.flash(msg);
+                    }
+                }
+            }
+            FlyoutAction::CopyHex | FlyoutAction::CopyRgb => {
+                if let FlyoutKind::Color([r, g, b]) = f.kind {
+                    let text = if action == FlyoutAction::CopyHex { format!("#{r:02X}{g:02X}{b:02X}") } else { format!("rgb({r}, {g}, {b})") };
+                    let msg = self.copy_text(&text).map_or_else(|e| format!("Copy failed: {e}"), |()| format!("Copied {text}"));
+                    if let Some(f) = self.flyout.as_mut() {
+                        f.flash(msg);
+                    }
+                }
+            }
             FlyoutAction::ReleaseNotes => {
                 let url = match &f.kind {
                     FlyoutKind::Update(rel) if !rel.page.is_empty() => rel.page.clone(),
@@ -797,12 +854,76 @@ impl SnippyApp {
                 let dest = if dest.extension().is_none() { dest.with_extension("mp4") } else { dest };
                 move_file(&info.path, &dest).map(|()| dest).map_err(|e| e.to_string())
             }
-            FlyoutKind::Update(_) | FlyoutKind::Message => return,
+            FlyoutKind::Update(_) | FlyoutKind::Text(_) | FlyoutKind::Color(_) | FlyoutKind::Message => return,
         };
         match result {
             Ok(p) => f.set_path(p),
             Err(e) => f.flash(format!("Save failed: {e}")),
         }
+    }
+
+    /// Recognises text in `img` on a background thread (see `poll_ocr`).
+    fn start_ocr(&mut self, ctx: &egui::Context, img: RgbaImage) {
+        diag::log(&format!("app: reading text from a {}x{} area", img.width(), img.height()));
+        let (tx, rx) = mpsc::channel();
+        let c = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(ocr::recognize(&img));
+            c.request_repaint();
+        });
+        self.ocr_rx = Some(rx);
+        let anchor = self.flyout_anchor(ctx);
+        let mut f = Flyout::message("Reading text…", "", anchor);
+        f.hold();
+        self.flyout = Some(f);
+        self.show_home(ctx);
+    }
+
+    fn poll_ocr(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.ocr_rx else { return };
+        let res = match rx.try_recv() {
+            Ok(r) => r,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err("text recognition crashed".into()),
+        };
+        self.ocr_rx = None;
+        let anchor = self.flyout_anchor(ctx);
+        self.flyout = Some(match res {
+            Ok(text) => {
+                let text = text.trim().to_string();
+                diag::log(&format!("app: text recognised ({} chars)", text.chars().count()));
+                if !text.is_empty() {
+                    if let Err(e) = self.copy_text(&text) {
+                        diag::log(&format!("app: copying text failed: {e}"));
+                    }
+                }
+                Flyout::text(text, anchor)
+            }
+            Err(e) => {
+                diag::log(&format!("app: text recognition failed: {e}"));
+                Flyout::message("Couldn't read text", e, anchor)
+            }
+        });
+    }
+
+    fn color_picked(&mut self, ctx: &egui::Context, screen: usize, rgb: [u8; 3]) {
+        if let Phase::Overlay(ov) = &self.phase {
+            self.last_probe = ov.screens.get(screen).map(|s| s.screen.bounds().center());
+        }
+        let [r, g, b] = rgb;
+        let hex = format!("#{r:02X}{g:02X}{b:02X}");
+        diag::log(&format!("app: picked colour {hex}"));
+        let _ = self.copy_text(&hex);
+        let anchor = self.flyout_anchor(ctx);
+        self.flyout = Some(Flyout::color(rgb, anchor));
+        self.show_home(ctx);
+    }
+
+    fn copy_text(&mut self, text: &str) -> Result<(), String> {
+        if self.clipboard.is_none() {
+            self.clipboard = Some(Clipboard::new().map_err(|e| e.to_string())?);
+        }
+        self.clipboard.as_mut().unwrap().set_text(text.to_owned()).map_err(|e| e.to_string())
     }
 
     fn copy_to_clipboard(&mut self, img: &RgbaImage) -> Result<(), String> {
@@ -850,7 +971,10 @@ impl SnippyApp {
         diag::log("app: recording stopped");
         let anchor = self.flyout_anchor(ctx);
         self.flyout = Some(match recorder.stop() {
-            Ok(info) => Flyout::recording(ctx, info, anchor),
+            Ok(info) => {
+                self.history_add_recording(&info);
+                Flyout::recording(ctx, info, anchor)
+            }
             Err(e) => Flyout::message("Recording failed", e, anchor),
         });
         self.show_bar(ctx);
@@ -872,6 +996,7 @@ impl eframe::App for SnippyApp {
     /// on the UI thread — the worker thread never touches the window.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_updates(ctx);
+        self.poll_ocr(ctx);
         self.handle_events(ctx);
         let Some(rx) = &self.capture_rx else { return };
         let result = match rx.try_recv() {
@@ -886,12 +1011,13 @@ impl eframe::App for SnippyApp {
         }
         match result {
             // Full screen with a single monitor: no need to ask which one.
-            Ok(mut cap) if cap.mode == CaptureMode::FullScreen && cap.screens.len() == 1 => {
+            Ok(mut cap) if cap.mode == CaptureMode::FullScreen && cap.screens.len() == 1 && matches!(cap.purpose, Purpose::Snip | Purpose::Record) => {
                 let s = cap.screens.remove(0);
                 self.last_probe = Some(s.bounds().center());
-                match cap.purpose {
-                    Purpose::Snip => self.finish_snip(ctx, s.image),
-                    Purpose::Record => self.begin_recording(ctx, RecordTarget { monitor_id: s.monitor_id, region: None }, None),
+                if cap.purpose == Purpose::Snip {
+                    self.finish_snip(ctx, s.image);
+                } else {
+                    self.begin_recording(ctx, RecordTarget { monitor_id: s.monitor_id, region: None }, None);
                 }
             }
             Ok(cap) => self.show_overlay(ctx, cap),
@@ -917,6 +1043,7 @@ impl eframe::App for SnippyApp {
                 let outcome = overlay.ui(ui);
                 match outcome {
                     Some(OverlayOutcome::Selected { screen, px }) => self.overlay_selected(&ctx, screen, px),
+                    Some(OverlayOutcome::Color { screen, rgb }) => self.color_picked(&ctx, screen, rgb),
                     Some(OverlayOutcome::Cancel) => {
                         diag::log("app: selection cancelled");
                         self.show_home(&ctx)
@@ -930,8 +1057,13 @@ impl eframe::App for SnippyApp {
             Phase::Editor => self.editor_ui(ui),
             Phase::Recording { .. } => self.recording_ui(ui),
         }
+        // Pins stay on screen in every phase (an immediate window not shown in a frame closes).
+        self.show_pins(&ctx);
         if !matches!(self.phase, Phase::Capturing | Phase::Overlay(_)) {
             self.handle_flyout(&ctx);
+            if self.history_open {
+                self.history_window(&ctx);
+            }
             if self.settings_open {
                 self.settings_window(&ctx);
             } else {

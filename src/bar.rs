@@ -25,6 +25,9 @@ enum Item {
     Speaker,
     Mic,
     Timer,
+    Ocr,
+    ColorPick,
+    History,
     Settings,
     HideToTray,
     // recording bar
@@ -46,11 +49,15 @@ impl Item {
 
 fn bar_items(s: &Settings) -> Vec<Item> {
     use CaptureMode::*;
-    let mut v = vec![Item::Grip, Item::Mode(Region), Item::Mode(Window), Item::Mode(FullScreen), Item::Sep, Item::RecordToggle];
+    let mut v = vec![Item::Grip, Item::Mode(Region), Item::Mode(Window), Item::Mode(FullScreen)];
+    if !s.record_mode {
+        v.extend([Item::Ocr, Item::ColorPick]);
+    }
+    v.extend([Item::Sep, Item::RecordToggle]);
     if s.record_mode {
         v.extend([Item::Speaker, Item::Mic]);
     }
-    v.extend([Item::Timer, Item::Sep, Item::Settings, Item::HideToTray]);
+    v.extend([Item::Timer, Item::Sep, Item::History, Item::Settings, Item::HideToTray]);
     v
 }
 
@@ -204,12 +211,15 @@ impl SnippyApp {
                         },
                         None,
                     ),
+                    Item::Ocr => (Icon::TextScan, "Copy text from screen".into(), None),
+                    Item::ColorPick => (Icon::Pipette, "Pick a colour".into(), None),
+                    Item::History => (Icon::History, "Recent captures".into(), self.history_open.then_some(Color32::from_white_alpha(30))),
                     Item::Settings => (Icon::Gear, "Settings".into(), self.settings_open.then_some(Color32::from_white_alpha(30))),
                     Item::HideToTray => (Icon::HideToTray, "Hide to system tray (right-click to exit)".into(), None),
                     Item::Status | Item::Pause | Item::Stop => continue,
                 };
 
-                let enabled = !capturing || matches!(item, Item::HideToTray | Item::Settings);
+                let enabled = !capturing || matches!(item, Item::HideToTray | Item::Settings | Item::History);
                 let resp = icon_button(ui, id, r, icon, fill, enabled, clear);
                 if item == Item::Timer && self.settings.delay_secs > 0 {
                     // little badge with the seconds
@@ -242,6 +252,9 @@ impl SnippyApp {
                                 _ => 0,
                             }
                         }
+                        Item::Ocr => self.start_capture(&ctx, Purpose::Ocr),
+                        Item::ColorPick => self.start_capture(&ctx, Purpose::ColorPick),
+                        Item::History => self.history_open = !self.history_open,
                         Item::Settings => self.settings_open = !self.settings_open,
                         Item::HideToTray => self.hide_to_tray(&ctx),
                         _ => {}

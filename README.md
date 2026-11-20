@@ -19,6 +19,15 @@ executable: no installer, no runtime dependencies.
 - A flyout in the corner offers **Edit · Copy · Save as · Open folder**
 - Editor: pen, highlighter, arrow and box; undo / redo; save as PNG or JPEG
 
+**Text, colours, pins & history**
+- **Copy text from screen:** select an area and its text goes to the clipboard, using the
+  OCR engine built into Windows (offline, nothing to install)
+- **Colour picker:** a magnifier follows the pointer; click to copy the colour as hex, with
+  one-click copy as HEX or RGB
+- **Pin to screen:** keep a snip floating on top of everything. Drag to move, mouse wheel to
+  zoom, hover for Copy / Close (Esc or double-click closes)
+- **History:** your recent snips and recordings with Copy, Edit, Pin, Open, Show in folder
+
 **Screen recording**
 - Record a region, a window or a full screen, on any monitor, to **MP4 (H.264 + AAC)**
 - **System audio** and/or **microphone**, mixed and kept in sync with the video
@@ -55,9 +64,12 @@ The floating bar, top to bottom:
 |---|---|
 | ⋮⋮ | Drag anywhere on the bar to move it |
 | Region / Window / Full screen | Start a snip (or a recording, in video mode) right away |
+| Text scan | Copy text from an area of the screen |
+| Pipette | Pick a colour from the screen |
 | Camera | Switch between screenshot mode and video mode (red) |
 | Speaker / Mic | *(video mode)* record system audio / microphone |
 | Timer | Delay (snips) or countdown (recordings): 0 → 3 → 5 → 10 s. Right-click resets |
+| Clock | Recent captures (history) |
 | Gear | Settings |
 | Tray arrow | Hide to the system tray (click the tray icon to bring it back). Right-click exits |
 

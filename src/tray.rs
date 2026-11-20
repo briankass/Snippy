@@ -13,7 +13,10 @@ pub enum TrayCmd {
     SnipRegion,
     SnipWindow,
     SnipScreen,
+    CopyText,
+    PickColor,
     Record,
+    History,
     ToggleBar,
     Settings,
     Exit,
@@ -39,14 +42,18 @@ mod imp {
         _icon: TrayIcon,
     }
 
-    const ITEMS: [(&str, &str); 7] = [
-        ("snip_region", "Snip region"),
-        ("snip_window", "Snip window"),
-        ("snip_screen", "Snip full screen"),
-        ("record", "Start recording…"),
-        ("toggle_bar", "Show / hide the bar"),
-        ("settings", "Settings"),
-        ("exit", "Exit Snippy"),
+    /// (id, label, separator before it)
+    const ITEMS: [(&str, &str, bool); 10] = [
+        ("snip_region", "Snip region", false),
+        ("snip_window", "Snip window", false),
+        ("snip_screen", "Snip full screen", false),
+        ("copy_text", "Copy text from screen", true),
+        ("pick_color", "Pick a colour", false),
+        ("record", "Start recording…", true),
+        ("history", "Recent captures", true),
+        ("toggle_bar", "Show / hide the bar", false),
+        ("settings", "Settings", false),
+        ("exit", "Exit Snippy", true),
     ];
 
     fn cmd(id: &str) -> Option<TrayCmd> {
@@ -54,6 +61,9 @@ mod imp {
             "snip_region" => TrayCmd::SnipRegion,
             "snip_window" => TrayCmd::SnipWindow,
             "snip_screen" => TrayCmd::SnipScreen,
+            "copy_text" => TrayCmd::CopyText,
+            "pick_color" => TrayCmd::PickColor,
+            "history" => TrayCmd::History,
             "record" => TrayCmd::Record,
             "toggle_bar" => TrayCmd::ToggleBar,
             "settings" => TrayCmd::Settings,
@@ -66,8 +76,8 @@ mod imp {
         /// Must be called on the UI (event-loop) thread.
         pub fn new(ctx: &egui::Context, tx: Sender<AppEvent>) -> Result<Self, String> {
             let menu = Menu::new();
-            for (i, (id, label)) in ITEMS.iter().enumerate() {
-                if i == 3 || i == 4 || i == 6 {
+            for (id, label, sep) in ITEMS.iter() {
+                if *sep {
                     menu.append(&PredefinedMenuItem::separator()).map_err(|e| e.to_string())?;
                 }
                 menu.append(&MenuItem::with_id(*id, *label, true, None)).map_err(|e| e.to_string())?;

@@ -36,6 +36,10 @@ pub enum Icon {
     Tray,
     Keyboard,
     HideToTray,
+    Pin,
+    History,
+    Pipette,
+    TextScan,
 }
 
 /// Draws `icon` centred in `rect` (scaled to fit), in `color`.
@@ -195,6 +199,31 @@ pub fn draw(p: &Painter, icon: Icon, rect: Rect, color: Color32) {
             for x in [6.0, 12.0, 18.0] {
                 p.circle_filled(pt(x, 14.6), 1.2 * s, color);
             }
+        }
+        Icon::Pin => {
+            // push-pin
+            closed(&[(9.0, 3.5), (15.0, 3.5), (14.0, 10.0), (17.5, 13.5), (6.5, 13.5), (10.0, 10.0)]);
+            line(&[(12.0, 13.5), (12.0, 21.0)]);
+        }
+        Icon::History => {
+            // clock with a "back" arrow
+            arc(12.0, 12.0, 8.0, -150.0, 180.0);
+            line(&[(4.0, 7.0), (4.5, 12.0), (8.8, 10.0)]);
+            line(&[(12.0, 7.5), (12.0, 12.0), (15.0, 14.0)]);
+        }
+        Icon::Pipette => {
+            // eyedropper
+            closed(&[(14.5, 4.5), (19.5, 9.5), (17.0, 12.0), (12.0, 7.0)]);
+            line(&[(13.0, 8.0), (5.5, 15.5), (4.5, 19.5), (8.5, 18.5), (16.0, 11.0)]);
+        }
+        Icon::TextScan => {
+            // scan corners around a "T"
+            line(&[(3.5, 8.0), (3.5, 3.5), (8.0, 3.5)]);
+            line(&[(16.0, 3.5), (20.5, 3.5), (20.5, 8.0)]);
+            line(&[(20.5, 16.0), (20.5, 20.5), (16.0, 20.5)]);
+            line(&[(8.0, 20.5), (3.5, 20.5), (3.5, 16.0)]);
+            line(&[(8.0, 8.0), (16.0, 8.0)]);
+            line(&[(12.0, 8.0), (12.0, 16.5)]);
         }
         Icon::HideToTray => {
             // arrow dropping into a tray

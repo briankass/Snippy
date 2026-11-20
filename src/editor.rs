@@ -132,6 +132,12 @@ impl SnippyApp {
                     self.save_final();
                 }
                 ui.separator();
+                if ui.button("📌 Pin").on_hover_text("Pin to screen (stays on top)").clicked() {
+                    if let Some(img) = self.editor.as_ref().map(Editor::final_image) {
+                        self.add_pin(&ctx, img);
+                    }
+                }
+                ui.separator();
                 if ui.button("✕ Close").on_hover_text("Close the editor").clicked() {
                     self.editor = None;
                     self.show_bar(&ctx);

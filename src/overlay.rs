@@ -27,6 +27,8 @@ pub(crate) enum OverlayOutcome {
     Cancel,
     /// `px`: selection in the chosen screen's image pixels.
     Selected { screen: usize, px: Rect },
+    /// Colour picked (colour-picker mode).
+    Color { screen: usize, rgb: [u8; 3] },
 }
 
 impl Overlay {
@@ -59,7 +61,11 @@ impl Overlay {
         });
         let to_points = |r: Rect| Rect::from_min_max(((r.min - origin) / ppp).to_pos2(), ((r.max - origin) / ppp).to_pos2());
         let rects: Vec<Rect> = self.screens.iter().map(|s| to_points(s.screen.bounds())).collect();
-        let verb = if self.purpose == Purpose::Record { "record" } else { "snip" };
+        let verb = match self.purpose {
+            Purpose::Record => "record",
+            Purpose::Ocr => "copy text from",
+            _ => "snip",
+        };
         let multi = self.screens.len() > 1;
         let mut outcome = None;
 
@@ -89,6 +95,30 @@ impl Overlay {
                     painter.galley(bg.center() - g.size() / 2.0, g, Color32::WHITE);
                 };
                 let hovered_here = hover == Some(i);
+
+                if self.purpose == Purpose::ColorPick {
+                    if hovered_here {
+                        if let Some(pt) = resp.hover_pos() {
+                            let px = to_px(pt);
+                            let (cx, cy) = (px.x.floor() as i64, px.y.floor() as i64);
+                            let get = |x: i64, y: i64| -> Option<[u8; 3]> {
+                                (x >= 0 && y >= 0 && (x as u32) < s.screen.image.width() && (y as u32) < s.screen.image.height())
+                                    .then(|| {
+                                        let p = s.screen.image.get_pixel(x as u32, y as u32);
+                                        [p[0], p[1], p[2]]
+                                    })
+                            };
+                            if let Some(rgb) = get(cx, cy) {
+                                draw_loupe(painter, rect, pt, rgb, &get, cx, cy);
+                                if resp.clicked() {
+                                    outcome = Some(OverlayOutcome::Color { screen: i, rgb });
+                                }
+                            }
+                        }
+                        hint("Click to copy a colour  ·  Esc to cancel");
+                    }
+                    continue;
+                }
 
                 match self.mode {
                     CaptureMode::FullScreen => {
@@ -130,7 +160,11 @@ impl Overlay {
                         Some((d, a, b)) if d == i => {
                             let sel = Rect::from_two_pos(a, b).intersect(rect);
                             dim_outside(painter, rect, sel, dim);
-                            let edge = if self.purpose == Purpose::Record { REC_RED } else { Color32::WHITE };
+                            let edge = match self.purpose {
+                                Purpose::Record => REC_RED,
+                                Purpose::Ocr => ACCENT,
+                                _ => Color32::WHITE,
+                            };
                             painter.rect_stroke(sel, 0.0, egui::Stroke::new(2.0, edge), egui::StrokeKind::Outside);
                             let px = Rect::from_two_pos(to_px(sel.min), to_px(sel.max));
                             let label = format!("{} × {}", px.width().round(), px.height().round());
@@ -171,6 +205,53 @@ impl Overlay {
         });
         outcome
     }
+}
+
+/// Magnifier for the colour picker: an 11×11-pixel neighbourhood at 11× zoom with the
+/// centre pixel outlined, plus the colour as hex and RGB.
+fn draw_loupe(
+    painter: &egui::Painter,
+    screen: Rect,
+    pointer: Pos2,
+    rgb: [u8; 3],
+    get: &dyn Fn(i64, i64) -> Option<[u8; 3]>,
+    cx: i64,
+    cy: i64,
+) {
+    const N: i64 = 11;
+    const CELL: f32 = 11.0;
+    let size = Vec2::splat(N as f32 * CELL);
+    let label_h = 44.0;
+    // Below-right of the pointer, flipped to stay on this screen.
+    let mut min = pointer + Vec2::new(24.0, 24.0);
+    if min.x + size.x > screen.max.x {
+        min.x = pointer.x - 24.0 - size.x;
+    }
+    if min.y + size.y + label_h > screen.max.y {
+        min.y = pointer.y - 24.0 - size.y - label_h;
+    }
+    let boxr = Rect::from_min_size(min, size);
+    painter.rect_filled(boxr.expand(4.0), 8.0, Color32::from_black_alpha(220));
+    for dy in 0..N {
+        for dx in 0..N {
+            let c = get(cx + dx - N / 2, cy + dy - N / 2).map_or(Color32::BLACK, |[r, g, b]| Color32::from_rgb(r, g, b));
+            let cell = Rect::from_min_size(boxr.min + Vec2::new(dx as f32 * CELL, dy as f32 * CELL), Vec2::splat(CELL));
+            painter.rect_filled(cell, 0.0, c);
+        }
+    }
+    let centre = Rect::from_min_size(boxr.min + Vec2::splat((N / 2) as f32 * CELL), Vec2::splat(CELL));
+    painter.rect_stroke(centre.expand(1.0), 0.0, egui::Stroke::new(1.0, Color32::BLACK), egui::StrokeKind::Outside);
+    painter.rect_stroke(centre, 0.0, egui::Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Outside);
+    let [r, g, b] = rgb;
+    let label = Rect::from_min_size(Pos2::new(boxr.min.x - 4.0, boxr.max.y + 6.0), Vec2::new(size.x + 8.0, label_h - 8.0));
+    painter.rect_filled(label, 8.0, Color32::from_black_alpha(220));
+    let sw = Rect::from_min_size(label.min + Vec2::new(8.0, 8.0), Vec2::splat(20.0));
+    painter.rect_filled(sw, 4.0, Color32::from_rgb(r, g, b));
+    painter.rect_stroke(sw, 4.0, egui::Stroke::new(1.0, Color32::WHITE), egui::StrokeKind::Outside);
+    painter.text(Pos2::new(sw.max.x + 8.0, label.min.y + 6.0), egui::Align2::LEFT_TOP, format!("#{r:02X}{g:02X}{b:02X}"),
+        egui::FontId::monospace(13.0), Color32::WHITE);
+    painter.text(Pos2::new(sw.max.x + 8.0, label.min.y + 21.0), egui::Align2::LEFT_TOP, format!("{r}, {g}, {b}"),
+        egui::FontId::monospace(11.0), Color32::from_gray(190));
 }
 
 pub(crate) fn dim_outside(painter: &egui::Painter, screen: Rect, sel: Rect, dim: Color32) {

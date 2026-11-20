@@ -8,7 +8,7 @@ use egui::{Sense, Stroke, StrokeKind};
 // A small glass card in the bottom-right corner (above the taskbar) after a snip or a
 // recording: thumbnail, where it was saved, and quick actions. Auto-dismisses unless hovered.
 
-const W: f32 = 520.0;
+const W: f32 = 590.0;
 const H: f32 = 136.0;
 const NOTE_H: f32 = 16.0;
 const TITLE: &str = "Snippy notification";
@@ -27,6 +27,10 @@ pub(crate) enum FlyoutKind {
     Snip { image: RgbaImage, path: Option<PathBuf> },
     Recording(RecordingInfo),
     Update(updater::Release),
+    /// Text recognised from the screen (already on the clipboard).
+    Text(String),
+    /// A colour picked from the screen.
+    Color([u8; 3]),
     Message,
 }
 
@@ -41,6 +45,10 @@ pub(crate) enum FlyoutAction {
     Delete,
     Update,
     ReleaseNotes,
+    Pin,
+    CopyText,
+    CopyHex,
+    CopyRgb,
 }
 
 pub(crate) struct Flyout {
@@ -118,6 +126,33 @@ impl Flyout {
         f
     }
 
+    /// Text copied from the screen: shows a preview.
+    pub(crate) fn text(text: String, anchor: Anchor) -> Self {
+        let lines = text.lines().filter(|l| !l.trim().is_empty()).count();
+        let words = text.split_whitespace().count();
+        let (title, subtitle) = if text.trim().is_empty() {
+            ("No text found".to_string(), "Try selecting a larger area, or text with more contrast".to_string())
+        } else {
+            (
+                format!("Text copied  ·  {words} word{}, {lines} line{}", if words == 1 { "" } else { "s" }, if lines == 1 { "" } else { "s" }),
+                text.split_whitespace().collect::<Vec<_>>().join(" "),
+            )
+        };
+        let mut f = Self::new(FlyoutKind::Message, title, subtitle, Vec::new(), None, anchor);
+        f.kind = FlyoutKind::Text(text);
+        f
+    }
+
+    /// A picked colour (hex already on the clipboard).
+    pub(crate) fn color(rgb: [u8; 3], anchor: Anchor) -> Self {
+        let [r, g, b] = rgb;
+        let title = format!("Copied #{r:02X}{g:02X}{b:02X}");
+        let subtitle = format!("rgb({r}, {g}, {b})");
+        let mut f = Self::new(FlyoutKind::Message, title, subtitle, Vec::new(), None, anchor);
+        f.kind = FlyoutKind::Color(rgb);
+        f
+    }
+
     pub(crate) fn message(title: impl Into<String>, detail: impl Into<String>, anchor: Anchor) -> Self {
         Self::new(FlyoutKind::Message, title.into(), detail.into(), Vec::new(), None, anchor)
     }
@@ -126,7 +161,7 @@ impl Flyout {
         match &self.kind {
             FlyoutKind::Snip { path, .. } => path.as_deref(),
             FlyoutKind::Recording(info) => Some(&info.path),
-            FlyoutKind::Update(_) | FlyoutKind::Message => None,
+            FlyoutKind::Update(_) | FlyoutKind::Text(_) | FlyoutKind::Color(_) | FlyoutKind::Message => None,
         }
     }
 
@@ -135,7 +170,7 @@ impl Flyout {
         match &mut self.kind {
             FlyoutKind::Snip { path, .. } => *path = Some(new),
             FlyoutKind::Recording(info) => info.path = new,
-            FlyoutKind::Update(_) | FlyoutKind::Message => {}
+            FlyoutKind::Update(_) | FlyoutKind::Text(_) | FlyoutKind::Color(_) | FlyoutKind::Message => {}
         }
     }
 
@@ -197,8 +232,14 @@ impl Flyout {
                 action = Some(FlyoutAction::Close);
             }
 
-            // Thumbnail
+            // Thumbnail (or colour swatch)
             let mut text_x = full.min.x + 18.0;
+            if let FlyoutKind::Color([r, g, b]) = self.kind {
+                let boxr = Rect::from_min_size(full.min + Vec2::new(12.0, 12.0), Vec2::new(150.0, H - 24.0));
+                p.rect_filled(boxr, 8.0, Color32::from_rgb(r, g, b));
+                p.rect_stroke(boxr, 8.0, Stroke::new(1.0, Color32::from_white_alpha(90)), StrokeKind::Inside);
+                text_x = boxr.max.x + 16.0;
+            }
             if let Some(tex) = &self.thumb {
                 let boxr = Rect::from_min_size(full.min + Vec2::new(12.0, 12.0), Vec2::new(150.0, H - 24.0));
                 let scale = (boxr.width() / self.thumb_size.x).min(boxr.height() / self.thumb_size.y);
@@ -232,28 +273,35 @@ impl Flyout {
             }
 
             // Buttons
-            let buttons: &[(FlyoutAction, Icon, &str)] = match self.kind {
-                FlyoutKind::Snip { .. } => &[
-                    (FlyoutAction::Edit, Icon::Edit, "Edit"),
-                    (FlyoutAction::Copy, Icon::Copy, "Copy"),
-                    (FlyoutAction::SaveAs, Icon::Save, "Save as"),
-                    (FlyoutAction::OpenFolder, Icon::Folder, ""),
+            let buttons: Vec<(FlyoutAction, Icon, String)> = match &self.kind {
+                FlyoutKind::Snip { .. } => vec![
+                    (FlyoutAction::Edit, Icon::Edit, "Edit".into()),
+                    (FlyoutAction::Copy, Icon::Copy, "Copy".into()),
+                    (FlyoutAction::Pin, Icon::Pin, "Pin".into()),
+                    (FlyoutAction::SaveAs, Icon::Save, "Save as".into()),
+                    (FlyoutAction::OpenFolder, Icon::Folder, String::new()),
                 ],
-                FlyoutKind::Recording(_) => &[
-                    (FlyoutAction::Play, Icon::Play, "Play"),
-                    (FlyoutAction::SaveAs, Icon::Save, "Save as"),
-                    (FlyoutAction::Delete, Icon::Trash, "Delete"),
-                    (FlyoutAction::OpenFolder, Icon::Folder, ""),
+                FlyoutKind::Recording(_) => vec![
+                    (FlyoutAction::Play, Icon::Play, "Play".into()),
+                    (FlyoutAction::SaveAs, Icon::Save, "Save as".into()),
+                    (FlyoutAction::Delete, Icon::Trash, "Delete".into()),
+                    (FlyoutAction::OpenFolder, Icon::Folder, String::new()),
                 ],
-                FlyoutKind::Update(_) => &[
-                    (FlyoutAction::Update, Icon::Refresh, "Update now"),
-                    (FlyoutAction::ReleaseNotes, Icon::Edit, "What's new"),
+                FlyoutKind::Update(_) => vec![
+                    (FlyoutAction::Update, Icon::Refresh, "Update now".into()),
+                    (FlyoutAction::ReleaseNotes, Icon::Edit, "What's new".into()),
                 ],
-                FlyoutKind::Message => &[],
+                FlyoutKind::Text(t) if !t.trim().is_empty() => vec![(FlyoutAction::CopyText, Icon::Copy, "Copy again".into())],
+                FlyoutKind::Color([r, g, b]) => vec![
+                    (FlyoutAction::CopyHex, Icon::Copy, format!("#{r:02X}{g:02X}{b:02X}")),
+                    (FlyoutAction::CopyRgb, Icon::Copy, format!("rgb({r}, {g}, {b})")),
+                ],
+                FlyoutKind::Text(_) | FlyoutKind::Message => vec![],
             };
             let mut x = text_x;
             let y = full.max.y - 14.0 - 32.0;
-            for &(act, icon, label) in buttons {
+            for (act, icon, label) in buttons {
+                let label = label.as_str();
                 let font = egui::FontId::proportional(13.5);
                 let galley = p.layout_no_wrap(label.to_string(), font, Color32::WHITE);
                 let w = if label.is_empty() { 32.0 } else { 36.0 + galley.size().x + 12.0 };
