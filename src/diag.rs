@@ -50,6 +50,29 @@ pub fn log(msg: &str) {
     let _ = writer().try_send(line);
 }
 
+/// Records crashes: the panic message and location are written to the log *synchronously*
+/// (the process may be about to exit), then the default handler runs.
+pub fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let line = format!(
+            "{}  CRASH (thread '{}'): {info}\n",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+            thread.name().unwrap_or("?")
+        );
+        let p = path();
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+            let _ = f.write_all(line.as_bytes());
+            let _ = f.flush();
+        }
+        default(info);
+    }));
+}
+
 /// Windows Snipping Tool detection (to catch presses that slip past Snippy).
 #[cfg(windows)]
 pub mod snipping_tool {

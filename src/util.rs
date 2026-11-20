@@ -67,7 +67,29 @@ pub(crate) fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
     })
 }
 
+/// Largest texture side we ever upload. GPUs reject (and the graphics stack aborts on)
+/// textures beyond their limit, typically 8192 or 16384 px; scrolling captures can be far
+/// taller than that.
+pub(crate) const MAX_TEXTURE_SIDE: u32 = 8192;
+
+/// Scales `img` down (keeping its aspect ratio) so neither side exceeds `max`. Returns
+/// `None` if it already fits.
+pub(crate) fn fit_within(img: &RgbaImage, max: u32) -> Option<RgbaImage> {
+    let (w, h) = (img.width(), img.height());
+    if w <= max && h <= max {
+        return None;
+    }
+    let s = max as f64 / w.max(h) as f64;
+    let (nw, nh) = (((w as f64 * s) as u32).clamp(1, max), ((h as f64 * s) as u32).clamp(1, max));
+    Some(imageops::resize(img, nw, nh, imageops::FilterType::Triangle))
+}
+
+/// Uploads an image for display. Images larger than the GPU texture limit are shown from a
+/// scaled-down copy (the full-resolution image is still what gets copied / saved).
 pub(crate) fn image_to_texture(ctx: &egui::Context, name: &str, img: &RgbaImage) -> egui::TextureHandle {
+    let limit = (ctx.input(|i| i.max_texture_side) as u32).clamp(2048, MAX_TEXTURE_SIDE);
+    let scaled = fit_within(img, limit);
+    let img = scaled.as_ref().unwrap_or(img);
     let size = [img.width() as usize, img.height() as usize];
     let color = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
     ctx.load_texture(name, color, egui::TextureOptions::LINEAR)
@@ -94,6 +116,15 @@ pub(crate) fn timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn huge_images_are_scaled_to_fit_the_gpu_limit() {
+        let tall = RgbaImage::new(300, 30_000);
+        let fitted = fit_within(&tall, MAX_TEXTURE_SIDE).unwrap();
+        assert!(fitted.height() <= MAX_TEXTURE_SIDE && fitted.width() >= 1);
+        assert_eq!(fitted.height(), MAX_TEXTURE_SIDE);
+        assert!(fit_within(&RgbaImage::new(3840, 2160), MAX_TEXTURE_SIDE).is_none());
+    }
 
     fn solid(w: u32, h: u32) -> RgbaImage {
         RgbaImage::from_pixel(w, h, Rgba([255, 255, 255, 255]))

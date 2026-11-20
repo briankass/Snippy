@@ -1171,6 +1171,7 @@ impl eframe::App for SnippyApp {
 }
 
 fn main() -> eframe::Result<()> {
+    diag::install_panic_hook();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(bar::bar_size(&Settings::default()))

@@ -473,12 +473,24 @@ fn capture_loop(
     Ok(())
 }
 
+/// A thumbnail at most `max_w` wide and never much taller than it. Very tall images
+/// (scrolling captures) show their top part, so the thumbnail stays a sensible shape and
+/// size (a 360-px-wide copy of a 30 000-px page would still be thousands of pixels tall).
 pub fn make_thumbnail(img: &RgbaImage, max_w: u32) -> RgbaImage {
-    if img.width() <= max_w {
-        return img.clone();
+    let (w, h) = (img.width().max(1), img.height().max(1));
+    // Crop very tall images to their top (aspect at most 1 : 1.5).
+    let max_h_src = (w as u64 * 3 / 2).max(1) as u32;
+    let src: std::borrow::Cow<RgbaImage> = if h > max_h_src {
+        std::borrow::Cow::Owned(imageops::crop_imm(img, 0, 0, w, max_h_src).to_image())
+    } else {
+        std::borrow::Cow::Borrowed(img)
+    };
+    let (sw, sh) = (src.width(), src.height());
+    if sw <= max_w {
+        return src.into_owned();
     }
-    let h = (img.height() as u64 * max_w as u64 / img.width() as u64).max(1) as u32;
-    imageops::thumbnail(img, max_w, h)
+    let th = (sh as u64 * max_w as u64 / sw as u64).max(1) as u32;
+    imageops::thumbnail(&*src, max_w, th)
 }
 
 // ───────────────────────────── Encoder thread ─────────────────────────────
@@ -845,6 +857,15 @@ mod tests {
         draw_cursor(&mut img, 45.0, 45.0, 1.0); // partially off-image: must not panic
         draw_cursor(&mut img, 5.0, 5.0, 1.0);
         assert_eq!(img.get_pixel(8, 15)[3], 255);
+    }
+
+    #[test]
+    fn thumbnail_of_tall_capture_stays_small() {
+        // a narrow, very long scrolling capture
+        let t = make_thumbnail(&RgbaImage::new(300, 30_000), 360);
+        assert!(t.width() <= 360 && t.height() <= 450, "{}x{}", t.width(), t.height());
+        let t = make_thumbnail(&RgbaImage::new(1900, 14_000), 360);
+        assert!(t.width() == 360 && t.height() <= 540, "{}x{}", t.width(), t.height());
     }
 
     #[test]
