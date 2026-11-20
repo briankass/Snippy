@@ -45,11 +45,9 @@ pub fn configure(print_screen: bool, win_shift_s: bool) {
     WIN_SHIFT_S.store(win_shift_s, Ordering::Relaxed);
 }
 
-/// Called from the hook callback: must return immediately.
-fn fire(h: Hotkey) {
-    if let Some(q) = QUEUE.get() {
-        let _ = q.try_send(h);
-    }
+/// Called from the hook callback: must return immediately. Returns whether it was queued.
+fn fire(h: Hotkey) -> bool {
+    QUEUE.get().is_some_and(|q| q.try_send(h).is_ok())
 }
 
 /// Starts the notifier thread that turns queued hotkeys into app events + UI wake-ups.
@@ -64,6 +62,7 @@ fn start_notifier(ctx: &egui::Context, tx: Sender<AppEvent>) -> bool {
         .name("snippy-hotkey-notify".into())
         .spawn(move || {
             for h in qrx {
+                crate::diag::log(&format!("shortcut: {h:?} -> waking Snippy"));
                 if tx.send(AppEvent::Hotkey(h)).is_err() {
                     break;
                 }
@@ -80,6 +79,7 @@ pub fn install(ctx: &egui::Context, tx: Sender<AppEvent>) {
         return; // already installed
     }
     imp::opt_out_of_power_throttling();
+    imp::start_diagnostics();
     std::thread::Builder::new()
         .name("snippy-hotkeys".into())
         .spawn(|| unsafe { imp::run() })
@@ -176,38 +176,166 @@ mod imp {
             let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
             let down = wparam.0 as u32 == WM_KEYDOWN || wparam.0 as u32 == WM_SYSKEYDOWN;
             let injected = kb.flags.0 & LLKHF_INJECTED.0 != 0;
+            let is_prtsc = kb.vkCode == VK_SNAPSHOT.0 as u32;
+            let win = held(VK_LWIN) || held(VK_RWIN);
+            // Only the two shortcuts are ever looked at (and S only while Win is held).
+            let relevant = is_prtsc || (kb.vkCode == b'S' as u32 && win);
+            if !relevant {
+                return CallNextHookEx(None, code, wparam, lparam);
+            }
+            let m = mods();
+            let mut swallow = false;
+            let mut fired = None;
             if !injected {
-                if down && (kb.vkCode == VK_SNAPSHOT.0 as u32 || kb.vkCode == b'S' as u32) {
+                if down {
                     HOOK_SAW.store(GetTickCount(), Ordering::Relaxed);
                 }
-                // Print Screen (plain — Alt+PrtSc etc. keep their Windows behaviour)
-                if kb.vkCode == VK_SNAPSHOT.0 as u32 && PRINT_SCREEN.load(Ordering::Relaxed) {
-                    if down && !held(VK_MENU) && !held(VK_CONTROL) && !held(VK_SHIFT) {
+                if is_prtsc && PRINT_SCREEN.load(Ordering::Relaxed) {
+                    // Plain Print Screen (Alt+PrtSc etc. keep their Windows behaviour).
+                    if down && m & (M_ALT | M_CTRL | M_SHIFT) == 0 {
                         if !SWALLOWING_PRTSC.swap(true, Ordering::Relaxed) {
-                            fire(Hotkey::PrintScreen); // once per press, not per auto-repeat
+                            fired = Some(fire(Hotkey::PrintScreen)); // once per press
                         }
-                        return LRESULT(1);
+                        swallow = true;
+                    } else if !down && SWALLOWING_PRTSC.swap(false, Ordering::Relaxed) {
+                        swallow = true;
                     }
-                    if !down && SWALLOWING_PRTSC.swap(false, Ordering::Relaxed) {
-                        return LRESULT(1);
-                    }
-                }
-                // Win+Shift+S
-                if kb.vkCode == b'S' as u32 && WIN_SHIFT_S.load(Ordering::Relaxed) {
-                    if down && (held(VK_LWIN) || held(VK_RWIN)) && held(VK_SHIFT) && !held(VK_CONTROL) && !held(VK_MENU) {
+                } else if !is_prtsc && WIN_SHIFT_S.load(Ordering::Relaxed) {
+                    if down && m & M_SHIFT != 0 && m & (M_CTRL | M_ALT) == 0 {
                         if !SWALLOWING_S.swap(true, Ordering::Relaxed) {
-                            fire(Hotkey::WinShiftS);
+                            fired = Some(fire(Hotkey::WinShiftS));
                         }
                         suppress_start_menu();
-                        return LRESULT(1);
-                    }
-                    if !down && SWALLOWING_S.swap(false, Ordering::Relaxed) {
-                        return LRESULT(1);
+                        swallow = true;
+                    } else if !down && SWALLOWING_S.swap(false, Ordering::Relaxed) {
+                        swallow = true;
                     }
                 }
             }
+            record(KeyRecord { source: Source::Hook, prtsc: is_prtsc, down, mods: m, injected, swallowed: swallow, fired });
+            if swallow {
+                return LRESULT(1);
+            }
         }
         CallNextHookEx(None, code, wparam, lparam)
+    }
+
+    const M_SHIFT: u8 = 1;
+    const M_CTRL: u8 = 2;
+    const M_ALT: u8 = 4;
+    const M_WIN: u8 = 8;
+
+    fn mods() -> u8 {
+        let mut m = 0;
+        if held(VK_SHIFT) {
+            m |= M_SHIFT;
+        }
+        if held(VK_CONTROL) {
+            m |= M_CTRL;
+        }
+        if held(VK_MENU) {
+            m |= M_ALT;
+        }
+        if held(VK_LWIN) || held(VK_RWIN) {
+            m |= M_WIN;
+        }
+        m
+    }
+
+    // ── Diagnostics: the hook and the raw-input watcher queue small records (never
+    //    blocking); a background thread writes them and watches for the Snipping Tool.
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Source {
+        Hook,
+        Raw,
+    }
+
+    #[derive(Clone, Copy)]
+    struct KeyRecord {
+        source: Source,
+        prtsc: bool,
+        down: bool,
+        mods: u8,
+        injected: bool,
+        swallowed: bool,
+        /// `Some(true)` = handed to Snippy; `Some(false)` = queue full; `None` = not fired.
+        fired: Option<bool>,
+    }
+
+    static RECORDS: OnceLock<SyncSender<KeyRecord>> = OnceLock::new();
+
+    fn record(r: KeyRecord) {
+        if let Some(q) = RECORDS.get() {
+            let _ = q.try_send(r);
+        }
+    }
+
+    fn mods_text(m: u8) -> String {
+        let mut v = Vec::new();
+        for (bit, name) in [(M_WIN, "Win"), (M_CTRL, "Ctrl"), (M_ALT, "Alt"), (M_SHIFT, "Shift")] {
+            if m & bit != 0 {
+                v.push(name);
+            }
+        }
+        if v.is_empty() { "none".into() } else { v.join("+") }
+    }
+
+    /// Starts the thread that logs key records and checks whether the Windows Snipping
+    /// Tool shows up after one of our shortcuts.
+    pub fn start_diagnostics() {
+        let (tx, rx) = mpsc::sync_channel::<KeyRecord>(64);
+        if RECORDS.set(tx).is_err() {
+            return;
+        }
+        std::thread::Builder::new()
+            .name("snippy-key-diag".into())
+            .spawn(move || {
+                let mut last_check = std::time::Instant::now() - std::time::Duration::from_secs(10);
+                for r in rx {
+                    let key = if r.prtsc { "Print Screen" } else { "S (Win held)" };
+                    let line = match r.source {
+                        Source::Hook => format!(
+                            "key: hook  {key} {}  mods={}{}  -> {}{}",
+                            if r.down { "down" } else { "up" },
+                            mods_text(r.mods),
+                            if r.injected { " (injected)" } else { "" },
+                            if r.swallowed { "swallowed" } else { "PASSED THROUGH to Windows" },
+                            match r.fired {
+                                Some(true) => ", sent to Snippy",
+                                Some(false) => ", NOT sent (queue full)",
+                                None => "",
+                            }
+                        ),
+                        Source::Raw => format!("key: raw   {key} down  mods={}", mods_text(r.mods)),
+                    };
+                    crate::diag::log(&line);
+                    // On a press: is the Snipping Tool running, and does it pop up?
+                    if r.down && r.source == Source::Raw && last_check.elapsed().as_millis() > 1500 {
+                        last_check = std::time::Instant::now();
+                        let before_pids = crate::diag::snipping_tool::pids().len();
+                        let before = crate::diag::snipping_tool::visible_windows();
+                        crate::diag::log(&format!(
+                            "snipping tool: {} process(es) running, {} visible window(s) at the press",
+                            before_pids, before
+                        ));
+                        std::thread::spawn(move || {
+                            // (elapsed ms, wait before this check)
+                            for (ms, wait) in [(250u64, 250u64), (750, 500), (2000, 1250)] {
+                                std::thread::sleep(std::time::Duration::from_millis(wait));
+                                let now = crate::diag::snipping_tool::visible_windows();
+                                if now > before {
+                                    crate::diag::log(&format!(
+                                        "snipping tool: WINDOW APPEARED ~{ms} ms after {key} ({before} -> {now} visible)"
+                                    ));
+                                    return;
+                                }
+                            }
+                        });
+                    }
+                }
+            })
+            .ok();
     }
 
     fn module() -> Option<HINSTANCE> {
@@ -260,6 +388,18 @@ mod imp {
             if got != u32::MAX && raw.header.dwType == RIM_TYPEKEYBOARD.0 {
                 let kb = raw.data.keyboard;
                 let key_down = (kb.Flags as u32 & RI_KEY_BREAK) == 0;
+                let win = held(VK_LWIN) || held(VK_RWIN);
+                if key_down && (kb.VKey == VK_SNAPSHOT.0 || (kb.VKey == b'S' as u16 && win)) {
+                    record(KeyRecord {
+                        source: Source::Raw,
+                        prtsc: kb.VKey == VK_SNAPSHOT.0,
+                        down: true,
+                        mods: mods(),
+                        injected: false,
+                        swallowed: false,
+                        fired: None,
+                    });
+                }
                 if key_down && is_our_shortcut(kb.VKey) {
                     let since = GetTickCount().wrapping_sub(HOOK_SAW.load(Ordering::Relaxed));
                     if since > MISS_WINDOW_MS {

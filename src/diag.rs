@@ -1,34 +1,108 @@
-//! Tiny diagnostics log: `%LOCALAPPDATA%\Snippy\snippy.log` (Windows) or the temp dir.
+//! Diagnostics log: `%LOCALAPPDATA%\Snippy\snippy.log` (Windows) or the temp dir.
 //!
-//! Records notable internal events only (e.g. "keyboard hook re-installed"), never what
-//! the user types. Capped in size: when it grows past the limit it's rotated to
-//! `snippy.old.log`.
-
-#![cfg_attr(not(windows), allow(dead_code))] // logged from Windows-only code
+//! Records Snippy's own events (shortcut handling, captures, flyouts, hook recovery) and,
+//! for the two global shortcuts only (Print Screen, and S while Win is held), how each
+//! press was handled. Never records other typing.
+//!
+//! Logging is asynchronous: callers just queue a line; a background thread writes it.
+//! The file is capped: past the limit it's rotated to `snippy.old.log`.
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::mpsc::{self, SyncSender};
+use std::sync::OnceLock;
 
-const MAX_BYTES: u64 = 256 * 1024;
-static LOCK: Mutex<()> = Mutex::new(());
+const MAX_BYTES: u64 = 512 * 1024;
+static TX: OnceLock<SyncSender<String>> = OnceLock::new();
 
 pub fn path() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
     base.join("Snippy").join("snippy.log")
 }
 
-/// Appends a timestamped line. Never panics, never blocks for long.
+fn writer() -> &'static SyncSender<String> {
+    TX.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<String>(1024);
+        std::thread::Builder::new()
+            .name("snippy-log".into())
+            .spawn(move || {
+                let p = path();
+                if let Some(dir) = p.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                for line in rx {
+                    if std::fs::metadata(&p).is_ok_and(|m| m.len() > MAX_BYTES) {
+                        let _ = std::fs::rename(&p, p.with_file_name("snippy.old.log"));
+                    }
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+                        let _ = f.write_all(line.as_bytes());
+                    }
+                }
+            })
+            .ok();
+        tx
+    })
+}
+
+/// Queues a timestamped line. Never blocks; drops the line if the queue is full.
 pub fn log(msg: &str) {
-    let Ok(_g) = LOCK.try_lock() else { return };
-    let p = path();
-    if let Some(dir) = p.parent() {
-        let _ = std::fs::create_dir_all(dir);
+    let line = format!("{}  {msg}\n", chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"));
+    let _ = writer().try_send(line);
+}
+
+/// Windows Snipping Tool detection (to catch presses that slip past Snippy).
+#[cfg(windows)]
+pub mod snipping_tool {
+    use windows::core::BOOL;
+    use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM};
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, IsWindowVisible};
+
+    /// Process names of the Windows Snipping Tool and its screen-capture overlay.
+    const NAMES: [&str; 2] = ["snippingtool.exe", "screenclippinghost.exe"];
+
+    /// PIDs of running Snipping Tool processes.
+    pub fn pids() -> Vec<u32> {
+        let mut out = Vec::new();
+        unsafe {
+            let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return out };
+            let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+            let mut ok = Process32FirstW(snap, &mut e).is_ok();
+            while ok {
+                let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+                let name = String::from_utf16_lossy(&e.szExeFile[..len]).to_ascii_lowercase();
+                if NAMES.contains(&name.as_str()) {
+                    out.push(e.th32ProcessID);
+                }
+                ok = Process32NextW(snap, &mut e).is_ok();
+            }
+            let _ = CloseHandle(snap);
+        }
+        out
     }
-    if std::fs::metadata(&p).is_ok_and(|m| m.len() > MAX_BYTES) {
-        let _ = std::fs::rename(&p, p.with_file_name("snippy.old.log"));
+
+    unsafe extern "system" fn count_visible(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let st = &mut *(lparam.0 as *mut (Vec<u32>, usize));
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if st.0.contains(&pid) && IsWindowVisible(hwnd).as_bool() {
+            st.1 += 1;
+        }
+        BOOL(1)
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
-        let _ = writeln!(f, "{} v{}  {msg}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"), env!("CARGO_PKG_VERSION"));
+
+    /// Number of visible top-level windows belonging to the Snipping Tool.
+    pub fn visible_windows() -> usize {
+        let pids = pids();
+        if pids.is_empty() {
+            return 0;
+        }
+        let mut st: (Vec<u32>, usize) = (pids, 0);
+        unsafe {
+            let _ = EnumWindows(Some(count_visible), LPARAM(&mut st as *mut _ as isize));
+        }
+        st.1
     }
 }

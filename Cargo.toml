@@ -1,6 +1,6 @@
 [package]
 name = "snippy"
-version = "0.7.4"
+version = "0.7.5"
 edition = "2021"
 description = "A tiny floating screen snipping and recording tool"
 
@@ -42,6 +42,7 @@ windows = { version = "0.62", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Input",
     "Win32_System_SystemInformation",
+    "Win32_System_Diagnostics_ToolHelp",
 ] }
 # System tray icon + menu
 tray-icon = "0.26"

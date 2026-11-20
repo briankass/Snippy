@@ -249,6 +249,18 @@ impl SnippyApp {
             events_rx,
         };
         app.sync_tray(&cc.egui_ctx);
+        diag::log(&format!(
+            "--- Snippy {} started. shortcuts: PrintScreen={} Win+Shift+S={} action={:?}; tray={} bar_hidden={}; \
+             Windows PrintScreen->SnippingTool={}; glass={:?}",
+            env!("CARGO_PKG_VERSION"),
+            app.settings.hotkey_print_screen,
+            app.settings.hotkey_win_shift_s,
+            app.settings.shortcut_action,
+            app.tray.is_some(),
+            app.bar_hidden(),
+            platform::prtsc_opens_snipping_tool(),
+            app.settings.look.backdrop,
+        ));
         if app.settings.check_updates {
             app.check_for_updates(&cc.egui_ctx, false);
         }
@@ -280,6 +292,7 @@ impl SnippyApp {
     /// The bar's "hide to tray" button: hides the bar until the tray icon is clicked (or a
     /// shortcut brings it up). Turns the tray icon on if needed, so Snippy stays reachable.
     pub(crate) fn hide_to_tray(&mut self, ctx: &egui::Context) {
+        diag::log("app: hide to tray");
         if !self.settings.tray_icon {
             self.settings.tray_icon = true;
             self.sync_tray(ctx);
@@ -341,8 +354,26 @@ impl SnippyApp {
         self.settings.hide_bar && self.tray.is_some()
     }
 
+    /// Logs a tray command and passes it through.
+    fn log_tray(&self, cmd: tray::TrayCmd) -> tray::TrayCmd {
+        diag::log(&format!("app: tray {cmd:?} while '{}'", self.phase_name()));
+        cmd
+    }
+
+    fn phase_name(&self) -> &'static str {
+        match self.phase {
+            Phase::Bar if self.bar_hidden() => "hidden in tray",
+            Phase::Bar => "bar",
+            Phase::Capturing => "capturing",
+            Phase::Overlay(_) => "selecting",
+            Phase::Editor => "editor",
+            Phase::Recording { .. } => "recording",
+        }
+    }
+
     /// Shows the bar (even in tray-only mode) and brings it to the front.
     fn reveal_bar(&mut self, ctx: &egui::Context) {
+        diag::log(&format!("app: show bar requested while '{}'", self.phase_name()));
         match self.phase {
             Phase::Bar => {
                 self.bar_revealed = true;
@@ -353,7 +384,7 @@ impl SnippyApp {
             // The editor is the same window; just bring it forward.
             Phase::Editor => ctx.send_viewport_cmd(egui::ViewportCommand::Focus),
             // Busy capturing / selecting / recording: ignore.
-            _ => {}
+            _ => diag::log("app: ignored (busy)"),
         }
     }
 
@@ -366,12 +397,15 @@ impl SnippyApp {
                 app.start_capture(ctx, Purpose::Snip);
             };
             match ev {
-                AppEvent::Hotkey(_) if self.settings.shortcut_action == ShortcutAction::ShowBar => self.reveal_bar(ctx),
+                AppEvent::Hotkey(h) if self.settings.shortcut_action == ShortcutAction::ShowBar => {
+                    diag::log(&format!("app: received {h:?}"));
+                    self.reveal_bar(ctx)
+                }
                 // "Start a snip": Win+Shift+S snips a region (like Windows); Print Screen uses
                 // the mode selected on the bar.
                 AppEvent::Hotkey(hotkeys::Hotkey::WinShiftS) => snip(self, Some(CaptureMode::Region)),
                 AppEvent::Hotkey(hotkeys::Hotkey::PrintScreen) => snip(self, None),
-                AppEvent::Tray(cmd) => match cmd {
+                AppEvent::Tray(cmd) => match self.log_tray(cmd) {
                     tray::TrayCmd::SnipRegion => snip(self, Some(CaptureMode::Region)),
                     tray::TrayCmd::SnipWindow => snip(self, Some(CaptureMode::Window)),
                     tray::TrayCmd::SnipScreen => snip(self, Some(CaptureMode::FullScreen)),
@@ -511,6 +545,7 @@ impl SnippyApp {
 
     /// Acts on a choice made in the overlay.
     fn overlay_selected(&mut self, ctx: &egui::Context, screen: usize, px: Rect) {
+        diag::log(&format!("app: selected {}x{} on screen {screen}", px.width().round(), px.height().round()));
         let Phase::Overlay(ov) = &mut self.phase else { return };
         let s = &ov.screens[screen].screen;
         self.last_probe = Some(s.bounds().center());
@@ -582,8 +617,10 @@ impl SnippyApp {
 
     fn start_capture(&mut self, ctx: &egui::Context, purpose: Purpose) {
         if self.capture_rx.is_some() || matches!(self.phase, Phase::Recording { .. } | Phase::Overlay(_)) {
+            diag::log(&format!("app: capture refused (busy: '{}')", self.phase_name()));
             return;
         }
+        diag::log(&format!("app: capture started ({purpose:?}, {:?})", self.settings.mode));
         self.flyout = None;
         self.tip = None;
         self.bar_revealed = false; // tray-only mode: the bar goes away again after this capture
@@ -640,6 +677,7 @@ impl SnippyApp {
         } else {
             (None, None)
         };
+        diag::log(&format!("app: snip done (copied={}, saved={}) -> flyout", copied.is_ok(), path.is_some()));
         self.flyout = Some(Flyout::snip(ctx, img, path, copied, save_err, anchor));
         self.show_home(ctx);
     }
@@ -672,7 +710,10 @@ impl SnippyApp {
         let Some(f) = self.flyout.as_mut() else { return };
         let Some(action) = f.show(ctx, &self.settings.look, self.glass, self.style_gen) else { return };
         match action {
-            FlyoutAction::Close => self.flyout = None,
+            FlyoutAction::Close => {
+                diag::log("app: flyout closed");
+                self.flyout = None
+            }
             FlyoutAction::Edit => {
                 if let Some(Flyout { kind: FlyoutKind::Snip { image, .. }, .. }) = self.flyout.take() {
                     self.show_editor(ctx, image);
@@ -785,6 +826,7 @@ impl SnippyApp {
         let dir = self.video_dir();
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join(format!("Recording {}.mp4", timestamp()));
+        diag::log("app: recording started");
         let recorder = Recorder::start(target, opts, path);
         self.phase = Phase::Recording { recorder, border };
         self.restore_main(ctx);
@@ -800,6 +842,7 @@ impl SnippyApp {
 
     fn stop_recording(&mut self, ctx: &egui::Context) {
         let Phase::Recording { recorder, .. } = std::mem::replace(&mut self.phase, Phase::Bar) else { return };
+        diag::log("app: recording stopped");
         let anchor = self.flyout_anchor(ctx);
         self.flyout = Some(match recorder.stop() {
             Ok(info) => Flyout::recording(ctx, info, anchor),
@@ -832,6 +875,10 @@ impl eframe::App for SnippyApp {
             Err(TryRecvError::Disconnected) => Err("capture thread crashed".into()),
         };
         self.capture_rx = None;
+        match &result {
+            Ok(cap) => diag::log(&format!("app: captured {} screen(s)", cap.screens.len())),
+            Err(e) => diag::log(&format!("app: capture failed: {e}")),
+        }
         match result {
             // Full screen with a single monitor: no need to ask which one.
             Ok(mut cap) if cap.mode == CaptureMode::FullScreen && cap.screens.len() == 1 => {
@@ -865,7 +912,10 @@ impl eframe::App for SnippyApp {
                 let outcome = overlay.ui(ui);
                 match outcome {
                     Some(OverlayOutcome::Selected { screen, px }) => self.overlay_selected(&ctx, screen, px),
-                    Some(OverlayOutcome::Cancel) => self.show_home(&ctx),
+                    Some(OverlayOutcome::Cancel) => {
+                        diag::log("app: selection cancelled");
+                        self.show_home(&ctx)
+                    }
                     None => {}
                 }
             }
