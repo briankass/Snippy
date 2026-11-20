@@ -3,8 +3,17 @@
 //!
 //! Windows reserves Win+Shift+S for itself (RegisterHotKey can't take it), so this uses a
 //! low-level keyboard hook that sees keys before the shell does and swallows the ones we
-//! handle. The hook runs on its own thread with its own message loop, so a busy UI never
-//! delays typing anywhere else.
+//! handle.
+//!
+//! Low-level hooks are fragile: Windows *silently removes* a hook whose callback doesn't
+//! return quickly (LowLevelHooksTimeout), and it deprioritises background apps with no
+//! visible window — exactly Snippy's state when it's hidden in the tray. So:
+//! * the callback never blocks: it only `try_send`s into a bounded queue; a separate
+//!   notifier thread wakes the UI;
+//! * the hook thread runs at the highest priority and the process opts out of power
+//!   throttling;
+//! * a watchdog re-installs the hook every few seconds, so even if Windows drops it,
+//!   shortcuts come back almost immediately.
 //!
 //! Limitation (by Windows design): low-level hooks don't see keys while a program running
 //! as administrator has focus.
@@ -14,8 +23,8 @@
 use crate::AppEvent;
 use eframe::egui;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
-use std::sync::{Mutex, OnceLock};
+use std::sync::mpsc::{self, Sender, SyncSender};
+use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hotkey {
@@ -25,7 +34,8 @@ pub enum Hotkey {
 
 static PRINT_SCREEN: AtomicBool = AtomicBool::new(false);
 static WIN_SHIFT_S: AtomicBool = AtomicBool::new(false);
-static SINK: OnceLock<Mutex<(Sender<AppEvent>, egui::Context)>> = OnceLock::new();
+/// Filled by the hook callback (never blocks: bounded + `try_send`).
+static QUEUE: OnceLock<SyncSender<Hotkey>> = OnceLock::new();
 
 /// Enables/disables each shortcut (cheap; the hook stays installed).
 pub fn configure(print_screen: bool, win_shift_s: bool) {
@@ -33,20 +43,41 @@ pub fn configure(print_screen: bool, win_shift_s: bool) {
     WIN_SHIFT_S.store(win_shift_s, Ordering::Relaxed);
 }
 
+/// Called from the hook callback: must return immediately.
 fn fire(h: Hotkey) {
-    if let Some(m) = SINK.get() {
-        if let Ok(g) = m.lock() {
-            let _ = g.0.send(AppEvent::Hotkey(h));
-            g.1.request_repaint();
-        }
+    if let Some(q) = QUEUE.get() {
+        let _ = q.try_send(h);
     }
+}
+
+/// Starts the notifier thread that turns queued hotkeys into app events + UI wake-ups.
+/// Returns false if already started.
+fn start_notifier(ctx: &egui::Context, tx: Sender<AppEvent>) -> bool {
+    let (qtx, qrx) = mpsc::sync_channel::<Hotkey>(16);
+    if QUEUE.set(qtx).is_err() {
+        return false;
+    }
+    let ctx = ctx.clone();
+    std::thread::Builder::new()
+        .name("snippy-hotkey-notify".into())
+        .spawn(move || {
+            for h in qrx {
+                if tx.send(AppEvent::Hotkey(h)).is_err() {
+                    break;
+                }
+                ctx.request_repaint();
+            }
+        })
+        .ok();
+    true
 }
 
 #[cfg(windows)]
 pub fn install(ctx: &egui::Context, tx: Sender<AppEvent>) {
-    if SINK.set(Mutex::new((tx, ctx.clone()))).is_err() {
+    if !start_notifier(ctx, tx) {
         return; // already installed
     }
+    imp::opt_out_of_power_throttling();
     std::thread::Builder::new()
         .name("snippy-hotkeys".into())
         .spawn(|| unsafe { imp::run() })
@@ -55,26 +86,52 @@ pub fn install(ctx: &egui::Context, tx: Sender<AppEvent>) {
 
 #[cfg(not(windows))]
 pub fn install(ctx: &egui::Context, tx: Sender<AppEvent>) {
-    let _ = SINK.set(Mutex::new((tx, ctx.clone())));
+    start_notifier(ctx, tx);
 }
 
 #[cfg(windows)]
 mod imp {
     use super::*;
-    use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, GetCurrentThread, ProcessPowerThrottling, SetProcessInformation, SetThreadPriority,
+        PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
+        THREAD_PRIORITY_TIME_CRITICAL,
+    };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
         VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT, VK_SNAPSHOT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage, HC_ACTION, KBDLLHOOKSTRUCT,
-        LLKHF_INJECTED, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
+        CallNextHookEx, DispatchMessageW, GetMessageW, SetTimer, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+        HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN, WM_TIMER,
     };
+
+    /// How often the hook is re-installed, in case Windows silently removed it.
+    const REINSTALL_MS: u32 = 10_000;
 
     /// True while we're swallowing an `S` press (so its key-up is swallowed too).
     static SWALLOWING_S: AtomicBool = AtomicBool::new(false);
     static SWALLOWING_PRTSC: AtomicBool = AtomicBool::new(false);
+
+    /// Hidden in the tray, Snippy has no visible window and Windows 11 may throttle it,
+    /// which can make the hook miss its deadline. Opt out of that.
+    pub fn opt_out_of_power_throttling() {
+        let state = PROCESS_POWER_THROTTLING_STATE {
+            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+            StateMask: 0, // 0 = "don't throttle execution speed"
+        };
+        unsafe {
+            let _ = SetProcessInformation(
+                GetCurrentProcess(),
+                ProcessPowerThrottling,
+                &state as *const _ as *const _,
+                std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+            );
+        }
+    }
 
     fn held(vk: VIRTUAL_KEY) -> bool {
         unsafe { (GetAsyncKeyState(vk.0 as i32) as u16) & 0x8000 != 0 }
@@ -93,6 +150,7 @@ mod imp {
         }
     }
 
+    /// The hook callback. Keep it tiny: no locks, no allocation, no blocking calls.
     unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if code == HC_ACTION as i32 {
             let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
@@ -102,8 +160,9 @@ mod imp {
                 // Print Screen (plain — Alt+PrtSc etc. keep their Windows behaviour)
                 if kb.vkCode == VK_SNAPSHOT.0 as u32 && PRINT_SCREEN.load(Ordering::Relaxed) {
                     if down && !held(VK_MENU) && !held(VK_CONTROL) && !held(VK_SHIFT) {
-                        SWALLOWING_PRTSC.store(true, Ordering::Relaxed);
-                        fire(Hotkey::PrintScreen);
+                        if !SWALLOWING_PRTSC.swap(true, Ordering::Relaxed) {
+                            fire(Hotkey::PrintScreen); // once per press, not per auto-repeat
+                        }
                         return LRESULT(1);
                     }
                     if !down && SWALLOWING_PRTSC.swap(false, Ordering::Relaxed) {
@@ -114,7 +173,7 @@ mod imp {
                 if kb.vkCode == b'S' as u32 && WIN_SHIFT_S.load(Ordering::Relaxed) {
                     if down && (held(VK_LWIN) || held(VK_RWIN)) && held(VK_SHIFT) && !held(VK_CONTROL) && !held(VK_MENU) {
                         if !SWALLOWING_S.swap(true, Ordering::Relaxed) {
-                            fire(Hotkey::WinShiftS); // once per press, not per auto-repeat
+                            fire(Hotkey::WinShiftS);
                         }
                         suppress_start_menu();
                         return LRESULT(1);
@@ -128,14 +187,31 @@ mod imp {
         CallNextHookEx(None, code, wparam, lparam)
     }
 
+    unsafe fn install_hook(module: Option<HINSTANCE>) -> Option<HHOOK> {
+        SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), module, 0).ok()
+    }
+
     pub unsafe fn run() {
-        let module = GetModuleHandleW(None).ok();
-        let Ok(_hook) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), module.map(Into::into), 0) else {
-            return;
-        };
+        // Answer key events promptly even when the system is busy.
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        let module: Option<HINSTANCE> = GetModuleHandleW(None).ok().map(Into::into);
+        let mut current = install_hook(module);
+        // A thread timer (no window): WM_TIMER arrives through this thread's message loop.
+        SetTimer(None, 0, REINSTALL_MS, None);
+
         // Low-level hooks are called through this thread's message loop.
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            if msg.message == WM_TIMER {
+                // Install the new hook *before* removing the old one so no key slips
+                // through in between (the newest hook runs first and swallows ours).
+                if let Some(fresh) = install_hook(module) {
+                    if let Some(old) = current.replace(fresh) {
+                        let _ = UnhookWindowsHookEx(old);
+                    }
+                }
+                continue;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
