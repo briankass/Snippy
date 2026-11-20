@@ -267,7 +267,7 @@ impl SnippyApp {
                     self.settings.delay_secs = 0;
                 }
                 if item == Item::HideToTray && resp.secondary_clicked() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    crate::quit(&ctx);
                 }
             }
         });

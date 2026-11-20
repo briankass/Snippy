@@ -87,7 +87,7 @@ impl SnippyApp {
             }
             UpdateState::Downloading { rx, .. } => match rx.try_recv() {
                 Ok(Ok(path)) => match updater::install_and_restart(&path) {
-                    Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                    Ok(()) => crate::quit(ctx),
                     Err(e) => self.update_failed(ctx, e),
                 },
                 Ok(Err(e)) => self.update_failed(ctx, e),

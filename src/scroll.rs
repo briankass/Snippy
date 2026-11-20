@@ -19,7 +19,7 @@ const MAX_STEPS: usize = 400;
 const SCROLLBAR_PX: u32 = 24;
 
 /// Number of column bins in a row signature.
-const BINS: usize = 64;
+const BINS: usize = 128;
 /// Mean per-bin difference (0-255 luma) under which two rows count as the same.
 /// Browsers don't re-render scrolled content bit-for-bit identically (anti-aliasing,
 /// colour-managed images, fractional display scaling), so matching must be tolerant.
@@ -35,9 +35,14 @@ pub struct Sig {
     info: bool,
 }
 
-/// Mean absolute per-bin difference between two rows.
+/// Total absolute per-bin difference between two rows (divide by `BINS` for the mean).
 fn dist(a: &Sig, b: &Sig) -> u32 {
-    a.bins.iter().zip(&b.bins).map(|(&x, &y)| x.abs_diff(y) as u32).sum::<u32>() / BINS as u32
+    a.bins.iter().zip(&b.bins).map(|(&x, &y)| x.abs_diff(y) as u32).sum::<u32>()
+}
+
+/// `dist` within a mean per-bin tolerance.
+fn within(a: &Sig, b: &Sig, tol: u32) -> bool {
+    dist(a, b) <= tol * BINS as u32
 }
 
 pub fn signatures(img: &RgbaImage) -> Vec<Sig> {
@@ -70,7 +75,7 @@ pub fn signatures(img: &RgbaImage) -> Vec<Sig> {
 pub fn fixed_bands(a: &[Sig], b: &[Sig]) -> Option<(usize, usize)> {
     let h = a.len().min(b.len());
     let cap = h * 35 / 100;
-    let same = |i: usize| dist(&a[i], &b[i]) <= SAME_TOL;
+    let same = |i: usize| within(&a[i], &b[i], SAME_TOL);
     let top = (0..h).take_while(|&i| same(i)).count();
     if top >= h.saturating_sub(4) {
         return None; // nothing moved
@@ -97,21 +102,27 @@ pub struct Match {
     pub percent: usize,
     /// Informative rows compared.
     pub rows: usize,
+    /// Average row difference at this shift, and at the best other shift.
+    pub cost: f64,
+    pub runner: f64,
 }
 
 impl std::fmt::Debug for Match {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "shift {} matched {}% of {} rows", self.shift, self.percent, self.rows)
+        write!(f, "shift {} matched {}% of {} rows, cost {:.1} vs {:.1}", self.shift, self.percent, self.rows, self.cost, self.runner)
     }
 }
 
 /// How far the content moved from `a` to `b`, ignoring the fixed bands.
 pub fn find_shift(a: &[Sig], b: &[Sig], top: usize, bottom: usize) -> Shift {
-    analyse(a, b, top, bottom).0
+    analyse(a, b, top, bottom, None).0
 }
 
 /// `find_shift`, plus the best alignment it found.
-pub fn analyse(a: &[Sig], b: &[Sig], top: usize, bottom: usize) -> (Shift, Option<Match>) {
+///
+/// `expect` is roughly how far the content should have moved (from earlier steps). It
+/// settles ambiguous cases, e.g. a smooth gradient that matches itself at many shifts.
+pub fn analyse(a: &[Sig], b: &[Sig], top: usize, bottom: usize, expect: Option<usize>) -> (Shift, Option<Match>) {
     let h = a.len().min(b.len());
     let (lo, hi) = (top, h.saturating_sub(bottom));
     if hi <= lo + 16 {
@@ -120,7 +131,7 @@ pub fn analyse(a: &[Sig], b: &[Sig], top: usize, bottom: usize) -> (Shift, Optio
     // Unchanged?
     let (same, info) = (lo..hi).fold((0, 0), |(m, t), r| {
         if a[r].info {
-            (m + (dist(&a[r], &b[r]) <= SAME_TOL) as usize, t + 1)
+            (m + within(&a[r], &b[r], SAME_TOL) as usize, t + 1)
         } else {
             (m, t)
         }
@@ -131,7 +142,8 @@ pub fn analyse(a: &[Sig], b: &[Sig], top: usize, bottom: usize) -> (Shift, Optio
     // Score every shift by its average (capped) row difference; capping keeps a changing
     // region (an animated ad, a video) from swamping an otherwise perfect match.
     let core = hi - lo;
-    let mut best: Option<(usize, usize, usize, u64)> = None; // (shift, matches, rows, cost)
+    // (shift, matches, rows, average cost)
+    let mut scores: Vec<(usize, usize, usize, f64)> = Vec::new();
     for s in 1..core.saturating_sub(8) {
         let (mut m, mut t, mut cost) = (0usize, 0usize, 0u64);
         for r in lo..hi - s {
@@ -139,29 +151,41 @@ pub fn analyse(a: &[Sig], b: &[Sig], top: usize, bottom: usize) -> (Shift, Optio
             if ra.info || rb.info {
                 let d = dist(ra, rb);
                 t += 1;
-                m += (d <= MATCH_TOL) as usize;
-                cost += d.min(40) as u64;
+                m += (d <= MATCH_TOL * BINS as u32) as usize;
+                cost += d.min(40 * BINS as u32) as u64;
             }
         }
-        if t < 12 {
-            continue;
-        }
-        let better = match best {
-            None => true,
-            // lower average cost wins; ties → more evidence
-            Some((_, _, bt, bc)) => cost * (bt as u64) < bc * (t as u64) || (cost * bt as u64 == bc * t as u64 && t > bt),
-        };
-        if better {
-            best = Some((s, m, t, cost));
+        if t >= 24 {
+            scores.push((s, m, t, cost as f64 / (t * BINS) as f64));
         }
     }
-    let Some((s, m, t, _)) = best else { return (Shift::Lost, None) };
-    let info = Match { shift: s, percent: m * 100 / t, rows: t };
-    if m * 100 >= t * 70 {
-        (Shift::By(s), Some(info))
-    } else {
-        (Shift::Lost, Some(info))
+    // Lowest average cost wins.
+    let Some(&(s, m, t, c)) = scores.iter().min_by(|x, y| x.3.total_cmp(&y.3)) else { return (Shift::Lost, None) };
+    // It must also stand out: lines of text look alike, so a wrong shift can match a fair
+    // share of rows. The real one is far better than any other (not neighbouring) shift.
+    let runner = scores.iter().filter(|x| x.0.abs_diff(s) > 4 && x.2 * 2 >= t).map(|x| x.3).fold(f64::INFINITY, f64::min);
+    let good = |c0: f64| c0 <= c * 1.6 + 1.5;
+    let enough = |m: usize, t: usize| m * 100 >= t * 80 || (t >= 300 && m * 100 >= t * 70);
+    let info = Match { shift: s, percent: m * 100 / t, rows: t, cost: c, runner };
+    if !enough(m, t) {
+        return (Shift::Lost, Some(info));
     }
+    if !good(runner) {
+        return (Shift::By(s), Some(info));
+    }
+    // Ambiguous: take the good candidate closest to the expected shift, if it's near it.
+    if let Some(e) = expect {
+        let pick = scores
+            .iter()
+            .filter(|x| good(x.3) && enough(x.1, x.2))
+            .min_by_key(|x| x.0.abs_diff(e));
+        if let Some(&(s2, m2, t2, c2)) = pick {
+            if s2.abs_diff(e) <= e / 4 + 8 {
+                return (Shift::By(s2), Some(Match { shift: s2, percent: m2 * 100 / t2, rows: t2, cost: c2, runner }));
+            }
+        }
+    }
+    (Shift::Lost, Some(info))
 }
 
 /// Builds the tall image from successive frames.
@@ -259,7 +283,10 @@ pub fn run(target: ScrollTarget, stop: Arc<AtomicBool>, progress: Arc<AtomicU32>
     let mut stitcher = Stitcher::new(first);
     progress.store(h, Ordering::Relaxed);
     let mut bands: Option<(usize, usize)> = None;
-    let mut notches = 3i32;
+    // Start small (how far a notch scrolls varies a lot between apps) and speed up.
+    let mut notches = 1i32;
+    // Pixels one notch scrolled, from clean steps (for settling ambiguous matches).
+    let mut per_notch: Option<f64> = None;
     let mut still = 0;
     let mut notes = Vec::new();
     let mut step = 0usize;
@@ -298,11 +325,11 @@ pub fn run(target: ScrollTarget, stop: Arc<AtomicBool>, progress: Arc<AtomicU32>
                 }
                 Some((f1, s1)) => {
                     let Some(mut b) = fixed_bands(&s1, &sig).or_else(|| fixed_bands(&prev_sig, &s1)) else { break };
-                    let mut res = analyse(&prev_sig, &s1, b.0, b.1);
+                    let mut res = analyse(&prev_sig, &s1, b.0, b.1, None);
                     if !matches!(res.0, Shift::By(_)) {
                         // Try the bands of the first pair instead.
                         if let Some(b0) = fixed_bands(&prev_sig, &s1) {
-                            let r0 = analyse(&prev_sig, &s1, b0.0, b0.1);
+                            let r0 = analyse(&prev_sig, &s1, b0.0, b0.1, None);
                             if matches!(r0.0, Shift::By(_)) {
                                 (b, res) = (b0, r0);
                             }
@@ -314,6 +341,7 @@ pub fn run(target: ScrollTarget, stop: Arc<AtomicBool>, progress: Arc<AtomicU32>
                             crate::diag::log(&format!("scroll step 1: By({s}), fixed bands top={} bottom={}, {:?}", b.0, b.1, res.1));
                             stitcher.push(f1, s, b);
                             prev_sig = s1;
+                            per_notch = Some(s as f64 / notches as f64);
                         }
                         other => {
                             crate::diag::log(&format!(
@@ -328,15 +356,41 @@ pub fn run(target: ScrollTarget, stop: Arc<AtomicBool>, progress: Arc<AtomicU32>
                 }
             },
         };
-        let (mut shift, mut best) = analyse(&prev_sig, &sig, b.0, b.1);
+        let expect = per_notch.map(|p| (p * notches as f64) as usize);
+        let (mut shift, mut best) = analyse(&prev_sig, &sig, b.0, b.1, expect);
         let (mut frame, mut sig) = (frame, sig);
-        if shift == Shift::Lost {
-            // Something may still have been settling (lazy-loaded images, animations): look again.
-            crate::diag::log(&format!("scroll step {step}: Lost (best {best:?}), retrying"));
-            std::thread::sleep(Duration::from_millis(500));
+        // Recovery: the page may still have been settling, or it scrolled further than the
+        // area's height (heavy pages can jump a long way), leaving no overlap. Look again,
+        // then step back one notch at a time until the frames line up.
+        let mut tries = 0;
+        while shift == Shift::Lost && tries < 14 && !stop.load(Ordering::Relaxed) {
+            tries += 1;
+            let dir = if tries == 1 {
+                0 // just look again
+            } else if matches!(find_shift(&sig, &prev_sig, b.0, b.1), Shift::By(_)) {
+                1 // we're above the previous frame: down a notch
+            } else {
+                -1 // past it: up a notch
+            };
+            crate::diag::log(&format!("scroll step {step}: Lost (best {best:?}), recovering (try {tries}, scroll {dir})"));
+            if dir == 0 {
+                std::thread::sleep(Duration::from_millis(400));
+            } else {
+                input::scroll(center, dir);
+            }
             frame = wait_until_still(&grab, &stop)?;
             sig = signatures(&frame);
-            (shift, best) = analyse(&prev_sig, &sig, b.0, b.1);
+            (shift, best) = analyse(&prev_sig, &sig, b.0, b.1, None);
+            if shift == Shift::None && dir != 0 {
+                // back exactly where we were: go down a notch
+                input::scroll(center, 1);
+                frame = wait_until_still(&grab, &stop)?;
+                sig = signatures(&frame);
+                (shift, best) = analyse(&prev_sig, &sig, b.0, b.1, None);
+            }
+            if matches!(shift, Shift::By(_)) {
+                notches = 1; // smaller steps from here on
+            }
         }
         crate::diag::log(&format!(
             "scroll step {step}: {shift:?}, fixed bands top={} bottom={}, {notches} notches, best {best:?}",
@@ -345,12 +399,15 @@ pub fn run(target: ScrollTarget, stop: Arc<AtomicBool>, progress: Arc<AtomicU32>
         match shift {
             Shift::By(s) => {
                 still = 0;
+                if tries == 0 {
+                    per_notch = Some(s as f64 / notches as f64);
+                }
                 let core = h as usize - b.0 - b.1;
                 // Keep plenty of overlap: scroll less if a step moved most of the area,
                 // more if it barely moved.
-                if s * 10 > core * 7 && notches > 1 {
+                if s * 2 > core && notches > 1 {
                     notches -= 1;
-                } else if s * 4 < core && notches < 8 {
+                } else if s * 5 < core && notches < 6 {
                     notches += 1;
                 }
                 stitcher.push(frame, s, b);
@@ -391,20 +448,50 @@ pub fn run(target: ScrollTarget, stop: Arc<AtomicBool>, progress: Arc<AtomicU32>
     Ok((stitcher.finish(), notes))
 }
 
-/// Captures until two consecutive frames are identical (smooth scrolling has settled), or
-/// ~1.2 s passes.
+/// Captures until the content stops moving (smooth-scrolling animations have settled), or
+/// ~2 s pass. "Stopped" tolerates a changing part of the area (a playing video, an
+/// animated ad): at least 75 % of the detailed rows must be unchanged between two looks.
 fn wait_until_still(grab: &dyn Fn() -> Result<RgbaImage, String>, stop: &AtomicBool) -> Result<RgbaImage, String> {
     std::thread::sleep(Duration::from_millis(140));
     let start = Instant::now();
     let mut last = grab()?;
+    let mut last_sig = signatures(&last);
+    let mut calm = 0;
     loop {
         std::thread::sleep(Duration::from_millis(90));
         let next = grab()?;
-        if next.as_raw() == last.as_raw() || start.elapsed() > Duration::from_millis(1200) || stop.load(Ordering::Relaxed) {
+        #[cfg(test)]
+        if let Ok(d) = std::env::var("SNIPPY_SCROLL_DUMP") {
+            static N: AtomicU32 = AtomicU32::new(0);
+            let _ = next.save(format!("{d}/g{:03}.png", N.fetch_add(1, Ordering::Relaxed)));
+        }
+        if next.as_raw() == last.as_raw() || start.elapsed() > Duration::from_millis(2000) || stop.load(Ordering::Relaxed) {
             return Ok(next);
         }
-        last = next;
+        let sig = signatures(&next);
+        // Mostly unchanged twice in a row (one look can catch a half-finished repaint).
+        if mostly_unchanged(&last_sig, &sig) {
+            calm += 1;
+            if calm >= 2 {
+                return Ok(next);
+            }
+        } else {
+            calm = 0;
+        }
+        (last, last_sig) = (next, sig);
     }
+}
+
+/// True if at least 75 % of the detailed rows are the same in both frames.
+fn mostly_unchanged(a: &[Sig], b: &[Sig]) -> bool {
+    let (same, info) = a.iter().zip(b).fold((0usize, 0usize), |(m, t), (x, y)| {
+        if x.info || y.info {
+            (m + within(x, y, SAME_TOL) as usize, t + 1)
+        } else {
+            (m, t)
+        }
+    });
+    info == 0 || same * 4 >= info * 3
 }
 
 /// Pointer and wheel input.
@@ -446,8 +533,9 @@ mod input {
     // Elsewhere (used for testing on Linux): drive the pointer with xdotool if present.
     #[cfg(not(windows))]
     pub fn scroll((x, y): (i32, i32), notches: i32) {
+        let button = if notches < 0 { "4" } else { "5" };
         let _ = std::process::Command::new("xdotool")
-            .args(["mousemove", &x.to_string(), &y.to_string(), "click", "--repeat", &notches.to_string(), "--delay", "15", "5"])
+            .args(["mousemove", &x.to_string(), &y.to_string(), "click", "--repeat", &notches.abs().to_string(), "--delay", "15", button])
             .status();
     }
 
@@ -530,7 +618,7 @@ mod tests {
                 b.put_pixel(x, y, Rgba([(x * 3 % 256) as u8, 0, (y % 256) as u8, 255]));
             }
         }
-        let (shift, m) = analyse(&signatures(&a), &signatures(&b), 0, 0);
+        let (shift, m) = analyse(&signatures(&a), &signatures(&b), 0, 0, None);
         assert_eq!(shift, Shift::By(211), "{m:?}");
         // and noise alone doesn't count as movement
         assert_eq!(find_shift(&signatures(&a), &signatures(&noisy(&a, 3)), 0, 0), Shift::None);
@@ -601,7 +689,7 @@ mod tests {
         println!("bands {b:?}");
         let mut st = Stitcher::new(frames[0].clone());
         for i in 1..frames.len() {
-            let (shift, m) = analyse(&sigs[i - 1], &sigs[i], b.0, b.1);
+            let (shift, m) = analyse(&sigs[i - 1], &sigs[i], b.0, b.1, None);
             println!("frame {i}: {shift:?} {m:?}");
             let Shift::By(s) = shift else { panic!("frame {i}: {shift:?}") };
             st.push(frames[i].clone(), s, b);
@@ -609,5 +697,17 @@ mod tests {
         let out = st.finish();
         out.save(format!("{dir}/stitched.png")).unwrap();
         println!("stitched {}x{}", out.width(), out.height());
+    }
+
+    /// End-to-end on a live display: `SNIPPY_SCROLL_LIVE="x,y,w,h"` (first monitor) and
+    /// `SNIPPY_SCROLL_OUT=file.png`. Run with `cargo test run_live -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn run_live() {
+        let r: Vec<u32> = std::env::var("SNIPPY_SCROLL_LIVE").unwrap().split(',').map(|v| v.parse().unwrap()).collect();
+        let target = ScrollTarget { monitor_id: None, region: [r[0], r[1], r[2], r[3]], origin: (0, 0) };
+        let (img, notes) = run(target, Arc::new(AtomicBool::new(false)), Arc::new(AtomicU32::new(0))).unwrap();
+        println!("result {}x{} notes {notes:?}", img.width(), img.height());
+        img.save(std::env::var("SNIPPY_SCROLL_OUT").unwrap()).unwrap();
     }
 }

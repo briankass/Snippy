@@ -334,7 +334,7 @@ impl SnippyApp {
         }
         if self.tray.is_none() {
             // No tray on this system: hiding would make Snippy unreachable, so exit instead.
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            quit(ctx);
             return;
         }
         self.tip = None;
@@ -464,7 +464,7 @@ impl SnippyApp {
                         }
                     }
                     tray::TrayCmd::Settings => self.settings_open = true,
-                    tray::TrayCmd::Exit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                    tray::TrayCmd::Exit => quit(ctx),
                 },
             }
         }
@@ -1098,6 +1098,17 @@ impl eframe::App for SnippyApp {
     /// Runs even while the window is hidden, so capture results are handled here
     /// on the UI thread — the worker thread never touches the window.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // The editor's close button closes the editor, not Snippy.
+        if ctx.input(|i| i.viewport().close_requested()) && !QUITTING.load(std::sync::atomic::Ordering::Relaxed) {
+            if matches!(self.phase, Phase::Editor) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                diag::log("app: editor closed");
+                self.editor = None;
+                self.show_bar(ctx);
+            } else {
+                QUITTING.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         self.poll_updates(ctx);
         self.poll_ocr(ctx);
         self.poll_scroll(ctx);
@@ -1228,6 +1239,15 @@ fn ghost_main(ctx: &egui::Context) {
 }
 
 /// Editor window size for an image of `img` pixels: native size where it fits.
+/// Set once Snippy is really exiting (as opposed to the editor window's close button).
+static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Exits Snippy.
+pub(crate) fn quit(ctx: &egui::Context) {
+    QUITTING.store(true, std::sync::atomic::Ordering::Relaxed);
+    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+}
+
 fn editor_size(img: Vec2, ppp: f32, monitor: Vec2) -> Vec2 {
     (img / ppp + Vec2::new(32.0, 110.0)).max(Vec2::new(760.0, 420.0)).min(monitor * 0.85)
 }
