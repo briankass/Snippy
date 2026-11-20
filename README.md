@@ -20,6 +20,9 @@ executable: no installer, no runtime dependencies.
 - Editor: pen, highlighter, arrow and box; undo / redo; save as PNG or JPEG
 
 **Text, colours, pins & history**
+- **Scrolling capture:** select the scrollable part of a window (e.g. a web page) and
+  Snippy scrolls it and stitches one tall image; sticky headers/footers appear once.
+  Esc or Stop ends it early
 - **Copy text from screen:** select an area and its text goes to the clipboard, using the
   OCR engine built into Windows (offline, nothing to install)
 - **Colour picker:** a magnifier follows the pointer; click to copy the colour as hex, with
@@ -64,6 +67,7 @@ The floating bar, top to bottom:
 |---|---|
 | ⋮⋮ | Drag anywhere on the bar to move it |
 | Region / Window / Full screen | Start a snip (or a recording, in video mode) right away |
+| Page with arrow | Scrolling capture of a long page |
 | Text scan | Copy text from an area of the screen |
 | Pipette | Pick a colour from the screen |
 | Camera | Switch between screenshot mode and video mode (red) |

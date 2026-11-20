@@ -64,6 +64,7 @@ impl Overlay {
         let verb = match self.purpose {
             Purpose::Record => "record",
             Purpose::Ocr => "copy text from",
+            Purpose::Scroll => "scroll-capture",
             _ => "snip",
         };
         let multi = self.screens.len() > 1;
@@ -162,7 +163,7 @@ impl Overlay {
                             dim_outside(painter, rect, sel, dim);
                             let edge = match self.purpose {
                                 Purpose::Record => REC_RED,
-                                Purpose::Ocr => ACCENT,
+                                Purpose::Ocr | Purpose::Scroll => ACCENT,
                                 _ => Color32::WHITE,
                             };
                             painter.rect_stroke(sel, 0.0, egui::Stroke::new(2.0, edge), egui::StrokeKind::Outside);

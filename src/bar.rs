@@ -25,6 +25,7 @@ enum Item {
     Speaker,
     Mic,
     Timer,
+    Scroll,
     Ocr,
     ColorPick,
     History,
@@ -51,7 +52,7 @@ fn bar_items(s: &Settings) -> Vec<Item> {
     use CaptureMode::*;
     let mut v = vec![Item::Grip, Item::Mode(Region), Item::Mode(Window), Item::Mode(FullScreen)];
     if !s.record_mode {
-        v.extend([Item::Ocr, Item::ColorPick]);
+        v.extend([Item::Scroll, Item::Ocr, Item::ColorPick]);
     }
     v.extend([Item::Sep, Item::RecordToggle]);
     if s.record_mode {
@@ -211,6 +212,7 @@ impl SnippyApp {
                         },
                         None,
                     ),
+                    Item::Scroll => (Icon::ScrollCapture, "Scrolling capture (long pages)".into(), None),
                     Item::Ocr => (Icon::TextScan, "Copy text from screen".into(), None),
                     Item::ColorPick => (Icon::Pipette, "Pick a colour".into(), None),
                     Item::History => (Icon::History, "Recent captures".into(), self.history_open.then_some(Color32::from_white_alpha(30))),
@@ -252,6 +254,7 @@ impl SnippyApp {
                                 _ => 0,
                             }
                         }
+                        Item::Scroll => self.start_capture(&ctx, Purpose::Scroll),
                         Item::Ocr => self.start_capture(&ctx, Purpose::Ocr),
                         Item::ColorPick => self.start_capture(&ctx, Purpose::ColorPick),
                         Item::History => self.history_open = !self.history_open,
@@ -287,7 +290,7 @@ impl SnippyApp {
         let (countdown, elapsed, paused, border) =
             (recorder.countdown_remaining(), recorder.elapsed(), recorder.is_paused(), *border);
         if let Some(area) = border {
-            show_recording_border(&ctx, area, paused);
+            show_area_border(&ctx, area, if paused { Color32::from_rgb(240, 180, 40) } else { REC_RED });
         }
 
         let mut stop = false;
@@ -356,6 +359,38 @@ impl SnippyApp {
         if stop {
             self.stop_recording(&ctx);
         }
+    }
+
+    /// Progress panel during a scrolling capture: height so far + Stop.
+    pub(crate) fn scrolling_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        ctx.request_repaint_after(Duration::from_millis(150));
+        let Phase::Scrolling { stop, progress, border, panel, .. } = &self.phase else { return };
+        let (border, panel) = (*border, *panel);
+        let height = progress.load(std::sync::atomic::Ordering::Relaxed);
+        let stop = stop.clone();
+        show_area_border(&ctx, border, ACCENT);
+        if let Some(h) = self.main_hwnd {
+            platform::place_hwnd(h, panel); // keep it put (DPI changes)
+        }
+        egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+            let full = ui.max_rect();
+            paint_glass_panel_min(ui.painter(), full, &self.settings.look, self.glass, RADIUS, 0.55);
+            let p = ui.painter();
+            let icon_r = Rect::from_center_size(Pos2::new(full.min.x + 24.0, full.center().y), Vec2::splat(22.0));
+            icons::draw(p, Icon::ScrollCapture, icon_r, ACCENT);
+            p.text(Pos2::new(full.min.x + 44.0, full.center().y - 9.0), egui::Align2::LEFT_CENTER,
+                format!("Scrolling capture · {height} px"), egui::FontId::proportional(14.0), Color32::WHITE);
+            p.text(Pos2::new(full.min.x + 44.0, full.center().y + 9.0), egui::Align2::LEFT_CENTER,
+                "Don't move the mouse · Esc to stop", egui::FontId::proportional(11.0), Color32::from_gray(185));
+            let stop_r = Rect::from_min_size(Pos2::new(full.max.x - 76.0, full.center().y - 15.0), Vec2::new(64.0, 30.0));
+            let resp = ui.interact(stop_r, ui.scope_id().with("scroll_stop"), Sense::click());
+            p.rect_filled(stop_r, 15.0, if resp.hovered() { REC_RED } else { REC_RED.gamma_multiply(0.85) });
+            p.text(stop_r.center(), egui::Align2::CENTER_CENTER, "Stop", egui::FontId::proportional(13.5), Color32::WHITE);
+            if resp.clicked() {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
     }
 
     /// Tooltips can't fit inside a 52 px window, so they get their own little window
@@ -437,7 +472,7 @@ fn on_off(b: bool) -> &'static str {
 /// don't rely on window transparency (which isn't available everywhere).
 /// `area` is in virtual-desktop physical pixels; strips are placed in physical pixels too,
 /// so they line up on any monitor whatever its display scaling.
-pub(crate) fn show_recording_border(ctx: &egui::Context, area: platform::PxRect, paused: bool) {
+pub(crate) fn show_area_border(ctx: &egui::Context, area: platform::PxRect, color: Color32) {
     let [l, t, r, b] = area;
     let (gap, th) = (1, 3);
     let (l, t, r, b) = (l - gap, t - gap, r + gap, b + gap);
@@ -448,7 +483,6 @@ pub(crate) fn show_recording_border(ctx: &egui::Context, area: platform::PxRect,
         [r, t, r + th, b],           // right
     ];
     let ppp = ctx.input(|i| i.viewport().native_pixels_per_point.unwrap_or(1.0));
-    let color = if paused { Color32::from_rgb(240, 180, 40) } else { REC_RED };
     for (i, s) in strips.into_iter().enumerate() {
         let title = format!("Snippy recording area {i}");
         // Approximate placement in points; corrected in physical pixels below.

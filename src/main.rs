@@ -24,6 +24,7 @@ mod pins;
 mod platform;
 mod prefs;
 mod record;
+mod scroll;
 mod tray;
 mod updater;
 mod util;
@@ -72,6 +73,8 @@ enum Purpose {
     Ocr,
     /// Pick a colour from the screen.
     ColorPick,
+    /// Scrolling capture of a long page.
+    Scroll,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize)]
@@ -181,6 +184,14 @@ enum Phase {
     Editor,
     /// `border`: recorded area in virtual-desktop physical pixels (None = whole monitor).
     Recording { recorder: Recorder, border: Option<platform::PxRect> },
+    /// Scrolling capture in progress; the main window is a small progress panel.
+    Scrolling {
+        rx: Receiver<Result<(RgbaImage, Vec<String>), String>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        progress: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        border: platform::PxRect,
+        panel: platform::PxRect,
+    },
 }
 
 struct SnippyApp {
@@ -392,6 +403,7 @@ impl SnippyApp {
             Phase::Overlay(_) => "selecting",
             Phase::Editor => "editor",
             Phase::Recording { .. } => "recording",
+            Phase::Scrolling { .. } => "scrolling",
         }
     }
 
@@ -434,6 +446,7 @@ impl SnippyApp {
                     tray::TrayCmd::SnipWindow => snip(self, Some(CaptureMode::Window)),
                     tray::TrayCmd::SnipScreen => snip(self, Some(CaptureMode::FullScreen)),
                     tray::TrayCmd::Record => self.start_capture(ctx, Purpose::Record),
+                    tray::TrayCmd::ScrollCapture => self.start_capture(ctx, Purpose::Scroll),
                     tray::TrayCmd::CopyText => self.start_capture(ctx, Purpose::Ocr),
                     tray::TrayCmd::PickColor => self.start_capture(ctx, Purpose::ColorPick),
                     tray::TrayCmd::History => self.history_open = true,
@@ -587,6 +600,12 @@ impl SnippyApp {
                 None => ov.drag = None,
             },
             Purpose::ColorPick => {}
+            Purpose::Scroll => {
+                let [x, y] = [px.min.x, px.min.y].map(|v| v.round().max(0.0) as u32);
+                let [w, h] = [px.width(), px.height()].map(|v| v.round().max(1.0) as u32);
+                let (origin, monitor_id, scale, bounds) = (s.origin, s.monitor_id, s.scale, s.bounds());
+                self.begin_scroll(ctx, monitor_id, [x, y, w, h], origin, scale, bounds);
+            }
             Purpose::Record => {
                 let monitor_id = s.monitor_id;
                 let whole = px.min.distance(full.min) < 1.0 && px.max.distance(full.max) < 1.0;
@@ -648,7 +667,7 @@ impl SnippyApp {
     }
 
     fn start_capture(&mut self, ctx: &egui::Context, purpose: Purpose) {
-        if self.capture_rx.is_some() || matches!(self.phase, Phase::Recording { .. } | Phase::Overlay(_)) {
+        if self.capture_rx.is_some() || matches!(self.phase, Phase::Recording { .. } | Phase::Overlay(_) | Phase::Scrolling { .. }) {
             diag::log(&format!("app: capture refused (busy: '{}')", self.phase_name()));
             return;
         }
@@ -674,7 +693,7 @@ impl SnippyApp {
         let mode = match purpose {
             Purpose::Snip | Purpose::Record => self.settings.mode,
             // Text and colour always pick from a frozen view of the screen.
-            Purpose::Ocr | Purpose::ColorPick => CaptureMode::Region,
+            Purpose::Ocr | Purpose::ColorPick | Purpose::Scroll => CaptureMode::Region,
         };
         // For snips the delay happens before the screenshot; for recordings it's a
         // countdown after you've picked the area.
@@ -862,6 +881,82 @@ impl SnippyApp {
         }
     }
 
+    /// Starts a scrolling capture of `region` (monitor pixels). The main window becomes a
+    /// small progress panel beside the area, out of the way of the pointer.
+    fn begin_scroll(&mut self, ctx: &egui::Context, monitor_id: Option<u32>, region: [u32; 4], origin: Pos2, scale: f32, monitor: Rect) {
+        use std::sync::atomic::{AtomicBool, AtomicU32};
+        use std::sync::Arc;
+        let [x, y, w, h] = region;
+        let (ox, oy) = (origin.x.round() as i32, origin.y.round() as i32);
+        let border = [ox + x as i32, oy + y as i32, ox + (x + w) as i32, oy + (y + h) as i32];
+        diag::log(&format!("app: scrolling capture of a {w}x{h} area"));
+        let stop = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(AtomicU32::new(h));
+        let (tx, rx) = mpsc::channel();
+        let (st, pr, c) = (stop.clone(), progress.clone(), ctx.clone());
+        let target = scroll::ScrollTarget { monitor_id, region, origin: (ox, oy) };
+        std::thread::spawn(move || {
+            let _ = tx.send(scroll::run(target, st, pr));
+            c.request_repaint();
+        });
+
+        // Progress panel: above the area if there's room, else below, else inside the top
+        // edge (it's excluded from capture on Windows, and the pointer sits mid-area).
+        let (pw, ph) = ((300.0 * scale) as i32, (46.0 * scale) as i32);
+        let gap = (10.0 * scale) as i32;
+        let (mon_top, mon_bottom) = (monitor.min.y as i32, monitor.max.y as i32);
+        let px = ((border[0] + border[2]) / 2 - pw / 2).clamp(monitor.min.x as i32, (monitor.max.x as i32 - pw).max(monitor.min.x as i32));
+        let py = if border[1] - gap - ph >= mon_top {
+            border[1] - gap - ph // above the area
+        } else if border[3] + gap + ph <= mon_bottom {
+            border[3] + gap // below
+        } else {
+            border[1] + gap // inside the top edge
+        };
+        let panel = [px, py, px + pw, py + ph];
+        self.phase = Phase::Scrolling { rx, stop, progress, border, panel };
+        // Restore the glass that the overlay switched off, but keep the saved bar position
+        // for when the capture finishes.
+        if self.overlay_unstyled {
+            self.overlay_unstyled = false;
+            if let Some(hw) = self.main_hwnd {
+                self.glass = platform::style_window(hw, self.settings.look.backdrop);
+            }
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+        ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
+        if !self.main_hwnd.is_some_and(|hw| platform::place_hwnd(hw, panel)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(Pos2::new(panel[0] as f32, panel[1] as f32) / scale));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(300.0, 46.0)));
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+    }
+
+    fn poll_scroll(&mut self, ctx: &egui::Context) {
+        let Phase::Scrolling { rx, .. } = &self.phase else { return };
+        let res = match rx.try_recv() {
+            Ok(r) => r,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err("scrolling capture crashed".into()),
+        };
+        match res {
+            Ok((img, notes)) => {
+                diag::log(&format!("app: scrolling capture done: {}x{}", img.width(), img.height()));
+                self.finish_snip(ctx, img);
+                if let Some(f) = self.flyout.as_mut() {
+                    f.notes.extend(notes);
+                }
+            }
+            Err(e) => {
+                diag::log(&format!("app: scrolling capture failed: {e}"));
+                let anchor = self.flyout_anchor(ctx);
+                self.flyout = Some(Flyout::message("Scrolling capture failed", e, anchor));
+                self.show_home(ctx);
+            }
+        }
+    }
+
     /// Recognises text in `img` on a background thread (see `poll_ocr`).
     fn start_ocr(&mut self, ctx: &egui::Context, img: RgbaImage) {
         diag::log(&format!("app: reading text from a {}x{} area", img.width(), img.height()));
@@ -997,6 +1092,7 @@ impl eframe::App for SnippyApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_updates(ctx);
         self.poll_ocr(ctx);
+        self.poll_scroll(ctx);
         self.handle_events(ctx);
         let Some(rx) = &self.capture_rx else { return };
         let result = match rx.try_recv() {
@@ -1056,6 +1152,7 @@ impl eframe::App for SnippyApp {
             Phase::Bar | Phase::Capturing => self.bar_ui(ui),
             Phase::Editor => self.editor_ui(ui),
             Phase::Recording { .. } => self.recording_ui(ui),
+            Phase::Scrolling { .. } => self.scrolling_ui(ui),
         }
         // Pins stay on screen in every phase (an immediate window not shown in a frame closes).
         self.show_pins(&ctx);

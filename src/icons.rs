@@ -40,6 +40,7 @@ pub enum Icon {
     History,
     Pipette,
     TextScan,
+    ScrollCapture,
 }
 
 /// Draws `icon` centred in `rect` (scaled to fit), in `color`.
@@ -215,6 +216,14 @@ pub fn draw(p: &Painter, icon: Icon, rect: Rect, color: Color32) {
             // eyedropper
             closed(&[(14.5, 4.5), (19.5, 9.5), (17.0, 12.0), (12.0, 7.0)]);
             line(&[(13.0, 8.0), (5.5, 15.5), (4.5, 19.5), (8.5, 18.5), (16.0, 11.0)]);
+        }
+        Icon::ScrollCapture => {
+            // a tall page with a down arrow
+            rrect(5.0, 2.5, 15.0, 21.5, 2.0);
+            line(&[(7.5, 7.0), (12.5, 7.0)]);
+            line(&[(7.5, 10.5), (12.5, 10.5)]);
+            line(&[(19.0, 8.0), (19.0, 19.0)]);
+            line(&[(16.5, 16.5), (19.0, 19.0), (21.5, 16.5)]);
         }
         Icon::TextScan => {
             // scan corners around a "T"

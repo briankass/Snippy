@@ -13,6 +13,7 @@ pub enum TrayCmd {
     SnipRegion,
     SnipWindow,
     SnipScreen,
+    ScrollCapture,
     CopyText,
     PickColor,
     Record,
@@ -43,10 +44,11 @@ mod imp {
     }
 
     /// (id, label, separator before it)
-    const ITEMS: [(&str, &str, bool); 10] = [
+    const ITEMS: [(&str, &str, bool); 11] = [
         ("snip_region", "Snip region", false),
         ("snip_window", "Snip window", false),
         ("snip_screen", "Snip full screen", false),
+        ("scroll_capture", "Scrolling capture", false),
         ("copy_text", "Copy text from screen", true),
         ("pick_color", "Pick a colour", false),
         ("record", "Start recording…", true),
@@ -61,6 +63,7 @@ mod imp {
             "snip_region" => TrayCmd::SnipRegion,
             "snip_window" => TrayCmd::SnipWindow,
             "snip_screen" => TrayCmd::SnipScreen,
+            "scroll_capture" => TrayCmd::ScrollCapture,
             "copy_text" => TrayCmd::CopyText,
             "pick_color" => TrayCmd::PickColor,
             "history" => TrayCmd::History,
