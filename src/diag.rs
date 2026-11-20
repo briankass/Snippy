@@ -59,10 +59,7 @@ pub mod snipping_tool {
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
     };
     use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_ESCAPE,
-    };
-    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetForegroundWindow, GetWindowThreadProcessId, IsWindowVisible};
+    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, IsWindowVisible};
 
     /// Process names of the Windows Snipping Tool and its screen-capture overlay.
     const NAMES: [&str; 2] = ["snippingtool.exe", "screenclippinghost.exe"];
@@ -109,30 +106,12 @@ pub mod snipping_tool {
         st.1
     }
 
-    /// Process owning the foreground window.
-    pub fn foreground_pid() -> u32 {
-        let mut pid = 0u32;
-        unsafe { GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut pid)) };
-        pid
-    }
-
     pub fn terminate(pid: u32) -> bool {
         unsafe {
             let Ok(h) = OpenProcess(PROCESS_TERMINATE, false, pid) else { return false };
             let ok = TerminateProcess(h, 0).is_ok();
             let _ = CloseHandle(h);
             ok
-        }
-    }
-
-    /// Presses Esc (cancels the Snipping Tool's capture overlay when it's in front).
-    pub fn send_escape() {
-        let key = |flags: KEYBD_EVENT_FLAGS| INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VK_ESCAPE, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
-        };
-        unsafe {
-            SendInput(&[key(KEYBD_EVENT_FLAGS(0)), key(KEYEVENTF_KEYUP)], std::mem::size_of::<INPUT>() as i32);
         }
     }
 }

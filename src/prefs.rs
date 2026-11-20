@@ -209,8 +209,8 @@ impl SnippyApp {
                 });
             }
             if cfg!(windows) {
-                row(ui, Icon::Close, "Close the Windows Snipping Tool if it still pops up",
-                    "Some keyboards and Windows itself can open it anyway. Only a Snipping Tool that starts right after a shortcut Snippy handled is closed, never one you already had open", |ui| {
+                row(ui, Icon::Close, "Close Windows' own capture overlay if it still pops up",
+                    "Windows opens its screen-clipping overlay (ScreenClippingHost) for Win+Shift+S even when Snippy handles the key; Snippy closes it right away. A Snipping Tool app you already had open is never touched", |ui| {
                     changed |= toggle(ui, &mut self.settings.close_snipping_tool).changed();
                 });
             }

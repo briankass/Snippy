@@ -431,51 +431,76 @@ mod imp {
         if v.is_empty() { "none".into() } else { v.join("+") }
     }
 
-    /// Watches for ~2.5 s whether the Windows Snipping Tool appears after a press. If it
-    /// does and Snippy already handled the press, closes it (if enabled) — but only a
-    /// process that started *after* the press (so an open Snipping Tool with unsaved work
-    /// is never killed), or, for an already-running one, just cancels its capture overlay
-    /// with Esc when that overlay is in front.
+    /// A watcher is running until this tick (0 = none). New presses extend it instead of
+    /// starting another one.
+    static WATCH_UNTIL: AtomicU32 = AtomicU32::new(0);
+    const WATCH_MS: u32 = 2500;
+
+    /// After a shortcut press, watches ~2.5 s for Windows' own capture UI and closes it
+    /// (if enabled and Snippy handled the press):
+    /// * `ScreenClippingHost.exe` — the built-in capture overlay Windows opens for
+    ///   Win+Shift+S even when the key is swallowed. It holds no user data, so whenever it
+    ///   shows a window during the watch it is closed. (No before/after comparison: it's
+    ///   often resident and shows its overlay at the same instant as the press.)
+    /// * `SnippingTool.exe` — only closed if it *started after* the press, so an open
+    ///   Snipping Tool with unsaved work is never touched.
     fn watch_for_snipping_tool(key: &'static str, handled: bool) {
         use crate::diag::snipping_tool as st;
-        let before = st::processes();
-        let before_pids: Vec<u32> = before.iter().map(|(p, _)| *p).collect();
-        let before_windows = st::visible_windows_of(&before_pids);
+        let now = unsafe { GetTickCount() };
+        let already = WATCH_UNTIL.swap(now.wrapping_add(WATCH_MS), Ordering::Relaxed);
+        if already != 0 && already.wrapping_sub(now) as i32 > 0 {
+            return; // a watcher is running; it now watches longer
+        }
+        let before: Vec<u32> = st::processes().into_iter().filter(|(_, n)| n == "snippingtool.exe").map(|(p, _)| p).collect();
         std::thread::spawn(move || {
             let close = handled && CLOSE_SNIPPING_TOOL.load(Ordering::Relaxed);
-            for step in 1..=17u64 {
-                std::thread::sleep(std::time::Duration::from_millis(150));
-                let ms = step * 150;
-                let now = st::processes();
-                let fresh: Vec<&(u32, String)> = now.iter().filter(|(p, _)| !before_pids.contains(p)).collect();
-                if !fresh.is_empty() {
-                    for (pid, name) in fresh {
-                        let outcome = if close {
-                            if st::terminate(*pid) { "closed it" } else { "couldn't close it" }
-                        } else if handled {
-                            "left it (auto-close is off)"
-                        } else {
-                            "left it (key went to Windows)"
-                        };
-                        crate::diag::log(&format!("snipping tool: {name} STARTED ~{ms} ms after {key} -> {outcome}"));
+            let start = std::time::Instant::now();
+            let initial = st::processes();
+            let initial_vis = st::visible_windows_of(&initial.iter().map(|(p, _)| *p).collect::<Vec<_>>()).len();
+            crate::diag::log(&format!(
+                "snipping check after {key}: running [{}], {initial_vis} visible window(s)",
+                initial.iter().map(|(p, n)| format!("{n}:{p}")).collect::<Vec<_>>().join(", ")
+            ));
+            let mut acted = false;
+            loop {
+                let procs = st::processes();
+                let ms = start.elapsed().as_millis();
+                // Windows' capture overlay host.
+                let host: Vec<u32> = procs.iter().filter(|(_, n)| n == "screenclippinghost.exe").map(|(p, _)| *p).collect();
+                if !host.is_empty() && !st::visible_windows_of(&host).is_empty() {
+                    let outcome = if close {
+                        let n = host.iter().filter(|p| st::terminate(**p)).count();
+                        if n > 0 { "closed it" } else { "couldn't close it" }
+                    } else if handled {
+                        "left it (auto-close is off)"
+                    } else {
+                        "left it (key went to Windows)"
+                    };
+                    crate::diag::log(&format!("snipping check: ScreenClippingHost.exe overlay VISIBLE ~{ms} ms after {key} -> {outcome}"));
+                    acted = true;
+                    if !close {
+                        break;
                     }
-                    return;
                 }
-                let pids: Vec<u32> = now.iter().map(|(p, _)| *p).collect();
-                let windows = st::visible_windows_of(&pids);
-                if windows.iter().any(|w| !before_windows.contains(w)) {
-                    let fg = st::foreground_pid();
-                    let outcome = if close && pids.contains(&fg) {
-                        st::send_escape();
-                        "cancelled its capture overlay (Esc)"
-                    } else if close {
-                        "left it (not in front)"
+                // The Snipping Tool app: only if it started after the press.
+                for (pid, name) in procs.iter().filter(|(p, n)| n == "snippingtool.exe" && !before.contains(p)) {
+                    let outcome = if close {
+                        if st::terminate(*pid) { "closed it" } else { "couldn't close it" }
                     } else {
                         "left it"
                     };
-                    crate::diag::log(&format!("snipping tool: already-running instance SHOWED A WINDOW ~{ms} ms after {key} -> {outcome}"));
-                    return;
+                    crate::diag::log(&format!("snipping check: {name} STARTED ~{ms} ms after {key} -> {outcome}"));
+                    acted = true;
                 }
+                let t = unsafe { GetTickCount() };
+                if (WATCH_UNTIL.load(Ordering::Relaxed).wrapping_sub(t) as i32) <= 0 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+            WATCH_UNTIL.store(0, Ordering::Relaxed);
+            if !acted {
+                crate::diag::log("snipping check: nothing appeared");
             }
         });
     }
@@ -490,7 +515,6 @@ mod imp {
         std::thread::Builder::new()
             .name("snippy-key-diag".into())
             .spawn(move || {
-                let mut last_check = std::time::Instant::now() - std::time::Duration::from_secs(10);
                 for r in rx {
                     let key = if r.prtsc { "Print Screen" } else { "S" };
                     let line = match r.source {
@@ -517,10 +541,8 @@ mod imp {
                     // After a shortcut press: does the Windows Snipping Tool pop up anyway?
                     // (It can, through paths a keyboard hook can't block: another hook
                     // that runs before ours, or keyboard software launching it directly.)
-                    if r.down && r.source == Source::Hook && last_check.elapsed().as_millis() > 1500 {
-                        last_check = std::time::Instant::now();
-                        let handled = r.swallowed;
-                        watch_for_snipping_tool(key, handled);
+                    if r.down && r.source == Source::Hook && (r.swallowed || r.prtsc || r.mods & M_WIN != 0) {
+                        watch_for_snipping_tool(key, r.swallowed);
                     }
                 }
             })
