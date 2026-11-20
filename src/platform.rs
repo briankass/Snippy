@@ -20,6 +20,8 @@ pub type PxRect = [i32; 4];
 /// How the window background is rendered by Windows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Backdrop {
+    /// No blur: the bar is see-through like clear glass (just our translucent layers).
+    Clear,
     /// Blur-behind via `SetWindowCompositionAttribute`. Stays on when the window isn't
     /// focused, which a floating toolbar almost never is. Windows 10 and 11.
     Blur,
@@ -33,11 +35,12 @@ pub enum Backdrop {
 }
 
 impl Backdrop {
-    pub const ALL: [Backdrop; 4] = [Backdrop::Blur, Backdrop::Acrylic, Backdrop::System, Backdrop::Off];
+    pub const ALL: [Backdrop; 5] = [Backdrop::Clear, Backdrop::Blur, Backdrop::Acrylic, Backdrop::System, Backdrop::Off];
 
     pub fn label(self) -> &'static str {
         match self {
-            Backdrop::Blur => "Frosted blur (recommended)",
+            Backdrop::Clear => "Clear glass",
+            Backdrop::Blur => "Frosted blur",
             Backdrop::Acrylic => "Acrylic",
             Backdrop::System => "Windows 11 backdrop",
             Backdrop::Off => "Off (solid)",
@@ -46,7 +49,8 @@ impl Backdrop {
 
     pub fn help(self) -> &'static str {
         match self {
-            Backdrop::Blur => "Blurs whatever is behind Snippy, always, even when it isn't the active window.",
+            Backdrop::Clear => "See straight through, like clear glass. Icons get a soft shadow so they stay readable.",
+            Backdrop::Blur => "Blurs whatever is behind Snippy, even when it isn't the active window.",
             Backdrop::Acrylic => "Blur with a subtle grain. On some PCs dragging the bar can feel slow.",
             Backdrop::System => "Windows 11's own acrylic. Windows only shows it while Snippy is focused, so the bar usually looks solid.",
             Backdrop::Off => "A solid dark panel. Use this if glass looks wrong on your PC.",
@@ -138,6 +142,8 @@ mod imp {
 
             match backdrop {
                 Backdrop::Off => false,
+                // The window is already per-pixel transparent; no system effect needed.
+                Backdrop::Clear => true,
                 Backdrop::Blur => set_accent(h, ACCENT_ENABLE_BLURBEHIND, 0),
                 // The gradient needs non-zero alpha or some builds draw nothing; our own
                 // painted tint goes on top anyway.

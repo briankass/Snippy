@@ -73,12 +73,33 @@ pub(crate) fn rec_bar_size() -> Vec2 {
 /// translucent layers (darkness, tint colour, frosting) the user can tune in Settings;
 /// without glass it's a nearly opaque dark panel with a hint of the tint.
 pub(crate) fn paint_glass_panel(p: &egui::Painter, rect: Rect, look: &Look, glass: bool, radius: f32) {
+    paint_glass_panel_min(p, rect, look, glass, radius, 0.0);
+}
+
+/// Like [`paint_glass_panel`], with a minimum darkness so text stays readable (tooltips,
+/// flyout) even with a very clear look.
+pub(crate) fn paint_glass_panel_min(p: &egui::Painter, rect: Rect, look: &Look, glass: bool, radius: f32, min_dark: f32) {
     let a = |f: f32, max: f32| (f.clamp(0.0, 1.0) * max) as u8;
     let [tr, tg, tb, _] = look.tint.to_array();
     if glass {
-        p.rect_filled(rect, radius, Color32::from_black_alpha(a(look.darkness, 235.0)));
+        p.rect_filled(rect, radius, Color32::from_black_alpha(a(look.darkness.max(min_dark), 235.0)));
         p.rect_filled(rect, radius, Color32::from_rgba_unmultiplied(tr, tg, tb, a(look.tint_strength, 200.0)));
         p.rect_filled(rect, radius, Color32::from_white_alpha(a(look.frosting, 120.0)));
+        // Soft reflection across the top, like light on a pane of glass.
+        let top = Rect::from_min_max(
+            Pos2::new(rect.min.x + 1.0, rect.min.y + radius * 0.6),
+            Pos2::new(rect.max.x - 1.0, rect.min.y + (rect.height() * 0.35).min(120.0)),
+        );
+        let mut mesh = egui::Mesh::default();
+        let (hi, lo) = (Color32::from_white_alpha(30), Color32::TRANSPARENT);
+        mesh.colored_vertex(top.left_top(), hi);
+        mesh.colored_vertex(top.right_top(), hi);
+        mesh.colored_vertex(top.right_bottom(), lo);
+        mesh.colored_vertex(top.left_bottom(), lo);
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        p.add(mesh);
+        p.rect_filled(Rect::from_min_max(rect.min + Vec2::new(radius, 0.5), Pos2::new(rect.max.x - radius, rect.min.y + 1.5)), 0.0, Color32::from_white_alpha(50));
     } else {
         p.rect_filled(rect, radius, Color32::from_rgba_unmultiplied(30, 30, 34, 250));
         p.rect_filled(rect, radius, Color32::from_rgba_unmultiplied(tr, tg, tb, a(look.tint_strength, 50.0)));
@@ -87,7 +108,7 @@ pub(crate) fn paint_glass_panel(p: &egui::Painter, rect: Rect, look: &Look, glas
 }
 
 /// Paints a square icon button and returns its response.
-fn icon_button(ui: &mut egui::Ui, id: egui::Id, rect: Rect, icon: Icon, fill: Option<Color32>, enabled: bool) -> egui::Response {
+fn icon_button(ui: &mut egui::Ui, id: egui::Id, rect: Rect, icon: Icon, fill: Option<Color32>, enabled: bool, shadow: bool) -> egui::Response {
     let resp = ui.interact(rect, id, if enabled { Sense::click() } else { Sense::hover() });
     let p = ui.painter();
     let mut icon_color = Color32::from_gray(236);
@@ -104,6 +125,12 @@ fn icon_button(ui: &mut egui::Ui, id: egui::Id, rect: Rect, icon: Icon, fill: Op
     if !enabled {
         icon_color = icon_color.gamma_multiply(0.4);
     }
+    if shadow && fill.is_none() {
+        // Over clear glass the background can be anything; a soft shadow keeps icons legible.
+        for off in [Vec2::new(0.0, 1.2), Vec2::new(1.0, 1.0), Vec2::new(-1.0, 1.0), Vec2::new(0.0, -0.6)] {
+            icons::draw(p, icon, rect.shrink(9.0).translate(off), Color32::from_black_alpha(110));
+        }
+    }
     icons::draw(p, icon, rect.shrink(9.0), icon_color);
     resp
 }
@@ -116,6 +143,7 @@ impl SnippyApp {
         let sel_fill = if record { REC_RED } else { self.settings.look.tint };
         let mut hovered_tip: Option<(String, f32)> = None;
         let mut resize = false;
+        let clear = self.settings.look.backdrop == platform::Backdrop::Clear && self.glass;
 
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
             let full = ui.max_rect();
@@ -182,7 +210,7 @@ impl SnippyApp {
                 };
 
                 let enabled = !capturing || matches!(item, Item::Close | Item::Settings);
-                let resp = icon_button(ui, id, r, icon, fill, enabled);
+                let resp = icon_button(ui, id, r, icon, fill, enabled, clear);
                 if item == Item::Timer && self.settings.delay_secs > 0 {
                     // little badge with the seconds
                     let badge = Rect::from_center_size(r.right_bottom() - Vec2::new(8.0, 8.0), Vec2::new(18.0, 14.0));
@@ -249,6 +277,7 @@ impl SnippyApp {
         let mut stop = false;
         let mut toggle_pause = false;
         let mut hovered_tip = None;
+        let clear = self.settings.look.backdrop == platform::Backdrop::Clear && self.glass;
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
             let full = ui.max_rect();
             paint_glass_panel(ui.painter(), full, &self.settings.look, self.glass, RADIUS);
@@ -284,14 +313,14 @@ impl SnippyApp {
                     },
                     Item::Pause => {
                         let (icon, tip) = if paused { (Icon::Play, "Resume") } else { (Icon::Pause, "Pause") };
-                        let resp = icon_button(ui, ui.scope_id().with(("rec", i)), r, icon, None, countdown.is_none());
+                        let resp = icon_button(ui, ui.scope_id().with(("rec", i)), r, icon, None, countdown.is_none(), clear);
                         if resp.hovered() {
                             hovered_tip = Some((tip.to_string(), r.center().y - full.min.y));
                         }
                         toggle_pause |= resp.clicked();
                     }
                     Item::Stop => {
-                        let resp = icon_button(ui, ui.scope_id().with(("rec", i)), r, Icon::Stop, Some(REC_RED), true);
+                        let resp = icon_button(ui, ui.scope_id().with(("rec", i)), r, Icon::Stop, Some(REC_RED), true, clear);
                         if resp.hovered() {
                             hovered_tip = Some(("Stop and save".to_string(), r.center().y - full.min.y));
                         }
@@ -354,7 +383,7 @@ impl SnippyApp {
         let (look, glass) = (self.settings.look, self.glass);
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("snippy_tooltip"), builder, |ui, _| {
             let r = ui.max_rect();
-            paint_glass_panel(ui.painter(), r, &look, glass, 6.0);
+            paint_glass_panel_min(ui.painter(), r, &look, glass, 6.0, 0.6);
             ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, &text, font.clone(), Color32::WHITE);
         });
         let gen = self.style_gen;

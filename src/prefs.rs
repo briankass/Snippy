@@ -18,6 +18,14 @@ pub(crate) enum UpdateState {
     Failed(String),
 }
 
+/// One-click looks (the tint colour is kept).
+const PRESETS: [(&str, Look); 4] = [
+    ("Clear", Look { backdrop: Backdrop::Clear, tint: ACCENT, tint_strength: 0.06, frosting: 0.0, darkness: 0.16 }),
+    ("Frosted", Look { backdrop: Backdrop::Blur, tint: ACCENT, tint_strength: 0.10, frosting: 0.08, darkness: 0.45 }),
+    ("Tinted", Look { backdrop: Backdrop::Blur, tint: ACCENT, tint_strength: 0.45, frosting: 0.10, darkness: 0.35 }),
+    ("Solid", Look { backdrop: Backdrop::Off, tint: ACCENT, tint_strength: 0.10, frosting: 0.0, darkness: 0.9 }),
+];
+
 /// Swatches for the glass tint.
 const TINTS: [(u8, u8, u8); 8] = [
     (255, 196, 77),  // amber
@@ -156,10 +164,42 @@ impl SnippyApp {
                     }
                 }
             });
+            let ctx = ui.ctx().clone();
+            row(ui, Icon::Tray, "Show icon in the system tray", "Quick snips and recording from the taskbar corner; left-click shows or hides the bar", |ui| {
+                if toggle(ui, &mut self.settings.tray_icon).changed() {
+                    self.sync_tray(&ctx);
+                }
+            });
+            if self.settings.tray_icon {
+                row(ui, Icon::Grid, "Hide the floating bar", "Run from the tray and shortcuts only (left-click the tray icon to bring the bar back)", |ui| {
+                    if toggle(ui, &mut self.settings.hide_bar).changed() && matches!(self.phase, Phase::Bar) {
+                        self.show_bar(&ctx);
+                    }
+                });
+            }
             row(ui, Icon::Refresh, "Check for updates automatically", "Looks for a new release on GitHub when Snippy starts", |ui| {
                 toggle(ui, &mut self.settings.check_updates);
             });
             self.update_row(ui);
+        });
+
+        // ── Shortcuts
+        section(ui, "Keyboard shortcuts", |ui| {
+            let mut changed = false;
+            row(ui, Icon::Keyboard, "Print Screen opens Snippy", "Instead of the Windows Snipping Tool (Alt+Print Screen keeps its usual job)", |ui| {
+                changed |= toggle(ui, &mut self.settings.hotkey_print_screen).changed();
+            });
+            row(ui, Icon::Keyboard, "Windows + Shift + S opens Snippy", "Replaces the Snipping Tool shortcut, so you can uninstall the Snipping Tool if you like", |ui| {
+                changed |= toggle(ui, &mut self.settings.hotkey_win_shift_s).changed();
+            });
+            if changed {
+                hotkeys::configure(self.settings.hotkey_print_screen, self.settings.hotkey_win_shift_s);
+            }
+            ui.add(egui::Label::new(RichText::new(
+                "Windows + Shift + S snips a region; Print Screen uses the mode selected on the bar. \
+                 Both capture the monitor under the mouse pointer. \
+                 Windows doesn't pass keys to Snippy while an app running as administrator is in front.",
+            ).size(11.0).weak()).wrap());
         });
 
         // ── Saving
@@ -195,6 +235,17 @@ impl SnippyApp {
         let before = self.settings.look;
         section(ui, "Appearance", |ui| {
             let look = &mut self.settings.look;
+            row(ui, Icon::Sun, "Look", "One-click styles; fine-tune them below", |ui| {
+                for (name, preset) in PRESETS.iter().rev() {
+                    let active = look.backdrop == preset.backdrop
+                        && (look.darkness - preset.darkness).abs() < 0.01
+                        && (look.frosting - preset.frosting).abs() < 0.01
+                        && (look.tint_strength - preset.tint_strength).abs() < 0.01;
+                    if ui.selectable_label(active, *name).clicked() {
+                        *look = Look { tint: look.tint, ..*preset };
+                    }
+                }
+            });
             row(ui, Icon::Grid, "Glass style", look.backdrop.help(), |ui| {
                 egui::ComboBox::from_id_salt("backdrop")
                     .selected_text(look.backdrop.label())

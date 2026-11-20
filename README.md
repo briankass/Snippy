@@ -27,13 +27,18 @@ executable: no installer, no runtime dependencies.
   encoder, video only.
 
 **Look & feel**
-- Frosted-glass bar with rounded corners; pick the glass style, tint colour, tint strength,
-  frosting and darkness in Settings
+- Glass bar with rounded corners: one-click **Clear**, **Frosted**, **Tinted** or **Solid**
+  looks, plus glass style, tint colour, tint strength, frosting and darkness in Settings
 - Snippy's own windows never appear in your screenshots or recordings
+
+**Shortcuts & tray**
+- **Print Screen** and **Windows + Shift + S** open Snippy instead of the Windows Snipping
+  Tool (each can be turned off in Settings)
+- System tray icon with quick snip / record actions; optional tray-only mode that hides the bar
 
 **Settings** (gear icon on the bar)
 - Screenshot and recording folders, auto-save on/off
-- Start with Windows
+- Start with Windows, tray icon, tray-only mode, keyboard shortcuts
 - Check for updates: automatically on startup and on demand; one click downloads the new
   version from GitHub Releases, swaps it in and restarts
 - Recording frame rate (15/30/60), mouse pointer on/off, default audio sources
@@ -88,6 +93,10 @@ Every push is built and tested on Windows by GitHub Actions. **To publish a rele
 GitHub Release with `snippy.exe` attached. Pushing a `v*` tag manually also works.
 
 ## Notes
+
+- **Shortcuts** use a low-level keyboard hook (Windows reserves Win+Shift+S, so a normal
+  hotkey can't claim it). Windows doesn't deliver keys to it while an app running as
+  administrator has focus.
 
 - **Glass:** "Frosted blur" (the default) uses a long-standing Windows composition API that
   keeps working when the bar isn't focused. "Windows 11 backdrop" uses the official API, but

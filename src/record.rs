@@ -693,7 +693,7 @@ fn strip_start_code(nal: &[u8]) -> &[u8] {
 // ───────────── mouse cursor (screen capture APIs don't include it) ─────────────
 
 #[cfg(windows)]
-fn cursor_position() -> Option<(i32, i32)> {
+pub(crate) fn cursor_position() -> Option<(i32, i32)> {
     use windows_sys::Win32::Foundation::POINT;
     use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
     let mut p = POINT { x: 0, y: 0 };
@@ -702,7 +702,7 @@ fn cursor_position() -> Option<(i32, i32)> {
 }
 
 #[cfg(not(windows))]
-fn cursor_position() -> Option<(i32, i32)> {
+pub(crate) fn cursor_position() -> Option<(i32, i32)> {
     None
 }
 

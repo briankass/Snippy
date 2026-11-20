@@ -1,5 +1,5 @@
 use super::*;
-use crate::bar::{paint_glass_panel, style_child_window};
+use crate::bar::{paint_glass_panel_min, style_child_window};
 use crate::icons::{self, Icon};
 use egui::{Sense, Stroke, StrokeKind};
 
@@ -170,7 +170,7 @@ impl Flyout {
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("snippy_flyout"), builder, |ui, _| {
             let full = ui.max_rect();
             hovered = ui.rect_contains_pointer(full);
-            paint_glass_panel(ui.painter(), full, &look, glass, 10.0);
+            paint_glass_panel_min(ui.painter(), full, &look, glass, 10.0, 0.55);
             let p = ui.painter().clone();
 
             // Close (×), top-right

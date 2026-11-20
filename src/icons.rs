@@ -33,6 +33,8 @@ pub enum Icon {
     Grid,
     Power,
     Pointer,
+    Tray,
+    Keyboard,
 }
 
 /// Draws `icon` centred in `rect` (scaled to fit), in `color`.
@@ -184,6 +186,21 @@ pub fn draw(p: &Painter, icon: Icon, rect: Rect, color: Color32) {
         }
         Icon::Pointer => {
             closed(&[(6.0, 3.5), (6.0, 19.0), (10.0, 15.5), (12.8, 21.0), (15.0, 20.0), (12.3, 14.5), (17.5, 14.5)]);
+        }
+        Icon::Tray => {
+            // taskbar with a small "up" chevron
+            line(&[(3.0, 18.0), (21.0, 18.0)]);
+            line(&[(8.0, 11.0), (12.0, 7.0), (16.0, 11.0)]);
+            for x in [6.0, 12.0, 18.0] {
+                p.circle_filled(pt(x, 14.6), 1.2 * s, color);
+            }
+        }
+        Icon::Keyboard => {
+            rrect(2.5, 6.0, 21.5, 18.0, 2.5);
+            for x in [6.0, 9.5, 13.0, 16.5] {
+                p.circle_filled(pt(x, 10.0), 0.95 * s, color);
+            }
+            line(&[(7.0, 14.0), (17.0, 14.0)]);
         }
         Icon::Trash => {
             line(&[(4.0, 6.5), (20.0, 6.5)]);

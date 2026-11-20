@@ -12,6 +12,7 @@ mod bar;
 mod capture;
 mod editor;
 mod flyout;
+mod hotkeys;
 mod icons;
 #[cfg(windows)]
 mod mf;
@@ -19,6 +20,7 @@ mod overlay;
 mod platform;
 mod prefs;
 mod record;
+mod tray;
 mod updater;
 mod util;
 
@@ -44,6 +46,18 @@ use xcap::{Monitor, Window};
 const ACCENT: Color32 = Color32::from_rgb(255, 196, 77);
 const REC_RED: Color32 = Color32::from_rgb(232, 58, 58);
 const RECORD_FPS: u32 = 30;
+/// App icon artwork (window/taskbar icon; the .exe icon is embedded by build.rs).
+const ICON_PNG: &[u8] = include_bytes!("../assets/snippy.png");
+/// Simplified artwork that stays legible at tray size.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const TRAY_PNG: &[u8] = include_bytes!("../assets/snippy-tray.png");
+
+/// Things that happen outside the UI (tray menu, global shortcuts).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) enum AppEvent {
+    Tray(tray::TrayCmd),
+    Hotkey(hotkeys::Hotkey),
+}
 
 /// Are we taking a screenshot or a video?
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -101,6 +115,11 @@ struct Settings {
     show_cursor: bool,
     look: Look,
     check_updates: bool,
+    tray_icon: bool,
+    /// Tray-only mode: the floating bar stays hidden until shown from the tray.
+    hide_bar: bool,
+    hotkey_print_screen: bool,
+    hotkey_win_shift_s: bool,
 }
 
 impl Default for Settings {
@@ -122,6 +141,10 @@ impl Default for Settings {
             show_cursor: true,
             look: Look::default(),
             check_updates: true,
+            tray_icon: true,
+            hide_bar: false,
+            hotkey_print_screen: true,
+            hotkey_win_shift_s: true,
         }
     }
 }
@@ -155,6 +178,11 @@ struct SnippyApp {
     /// Cached "start with Windows" state (reading the registry every frame is wasteful).
     startup: Option<bool>,
     prefs_status: String,
+    tray: Option<tray::Tray>,
+    /// Physical-pixel point on the monitor of the last capture (for placing the flyout).
+    last_probe: Option<Pos2>,
+    events_tx: mpsc::Sender<AppEvent>,
+    events_rx: Receiver<AppEvent>,
 }
 
 impl SnippyApp {
@@ -166,6 +194,9 @@ impl SnippyApp {
         let glass = main_hwnd.is_some_and(|h| platform::style_window(h, settings.look.backdrop));
         updater::cleanup_old();
         platform::refresh_startup_path();
+        let (events_tx, events_rx) = mpsc::channel();
+        hotkeys::install(&cc.egui_ctx, events_tx.clone());
+        hotkeys::configure(settings.hotkey_print_screen, settings.hotkey_win_shift_s);
         let mut app = Self {
             phase: Phase::Bar,
             settings,
@@ -183,11 +214,77 @@ impl SnippyApp {
             update: UpdateState::Idle,
             startup: None,
             prefs_status: String::new(),
+            tray: None,
+            last_probe: None,
+            events_tx,
+            events_rx,
         };
+        app.sync_tray(&cc.egui_ctx);
         if app.settings.check_updates {
             app.check_for_updates(&cc.egui_ctx, false);
         }
         app
+    }
+
+    /// Creates/removes the tray icon to match the setting.
+    fn sync_tray(&mut self, ctx: &egui::Context) {
+        match (self.settings.tray_icon, self.tray.is_some()) {
+            (true, false) => match tray::Tray::new(ctx, self.events_tx.clone()) {
+                Ok(t) => self.tray = Some(t),
+                Err(e) => {
+                    self.settings.tray_icon = false;
+                    self.prefs_status = format!("Couldn't add the tray icon: {e}");
+                }
+            },
+            (false, true) => self.tray = None,
+            _ => {}
+        }
+        if self.tray.is_none() && self.settings.hide_bar {
+            // Without a tray icon there'd be no way back to a hidden bar.
+            self.settings.hide_bar = false;
+            if matches!(self.phase, Phase::Bar) {
+                self.show_bar(ctx);
+            }
+        }
+    }
+
+    /// Bar hidden in tray-only mode.
+    fn bar_hidden(&self) -> bool {
+        self.settings.hide_bar && self.tray.is_some()
+    }
+
+    fn handle_events(&mut self, ctx: &egui::Context) {
+        while let Ok(ev) = self.events_rx.try_recv() {
+            let snip = |app: &mut Self, mode: Option<CaptureMode>| {
+                if let Some(m) = mode {
+                    app.settings.mode = m;
+                }
+                app.start_capture(ctx, Purpose::Snip);
+            };
+            match ev {
+                // Win+Shift+S always snips a region (like Windows); Print Screen uses the
+                // mode selected on the bar.
+                AppEvent::Hotkey(hotkeys::Hotkey::WinShiftS) => snip(self, Some(CaptureMode::Region)),
+                AppEvent::Hotkey(hotkeys::Hotkey::PrintScreen) => snip(self, None),
+                AppEvent::Tray(cmd) => match cmd {
+                    tray::TrayCmd::SnipRegion => snip(self, Some(CaptureMode::Region)),
+                    tray::TrayCmd::SnipWindow => snip(self, Some(CaptureMode::Window)),
+                    tray::TrayCmd::SnipScreen => snip(self, Some(CaptureMode::FullScreen)),
+                    tray::TrayCmd::Record => self.start_capture(ctx, Purpose::Record),
+                    tray::TrayCmd::ToggleBar => {
+                        self.settings.hide_bar = !self.settings.hide_bar;
+                        if matches!(self.phase, Phase::Bar) {
+                            self.show_bar(ctx);
+                            if !self.bar_hidden() {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                            }
+                        }
+                    }
+                    tray::TrayCmd::Settings => self.settings_open = true,
+                    tray::TrayCmd::Exit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                },
+            }
+        }
     }
 
     /// Re-applies the glass style to every window after it changed in Settings.
@@ -216,7 +313,7 @@ impl SnippyApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(bar::bar_size(&self.settings)));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(!self.bar_hidden()));
     }
 
     /// Back to the editor if one is open, otherwise to the bar.
@@ -287,17 +384,21 @@ impl SnippyApp {
     }
 
     fn start_capture(&mut self, ctx: &egui::Context, purpose: Purpose) {
-        if self.capture_rx.is_some() || matches!(self.phase, Phase::Recording { .. }) {
+        if self.capture_rx.is_some() || matches!(self.phase, Phase::Recording { .. } | Phase::Overlay(_)) {
             return;
         }
         self.flyout = None;
         self.tip = None;
 
-        // Capture the monitor Snippy is currently on (not always the primary one).
-        let probe = ctx.input(|i| {
-            let ppp = i.viewport().native_pixels_per_point.unwrap_or(1.0);
-            i.viewport().outer_rect.map(|r| r.center() * ppp)
+        // Capture the monitor under the mouse pointer (that's the bar's monitor when the bar
+        // was clicked; for shortcuts and the tray it's where the user is working).
+        let probe = record::cursor_position().map(|(x, y)| Pos2::new(x as f32, y as f32)).or_else(|| {
+            ctx.input(|i| {
+                let ppp = i.viewport().native_pixels_per_point.unwrap_or(1.0);
+                i.viewport().outer_rect.map(|r| r.center() * ppp)
+            })
         });
+        self.last_probe = probe;
         let mode = self.settings.mode;
         // For snips the delay happens before the screenshot; for recordings it's a
         // countdown after you've picked the area.
@@ -344,7 +445,7 @@ impl SnippyApp {
                 i.viewport().monitor_size.unwrap_or(Vec2::new(1920.0, 1080.0)),
             )
         });
-        let probe = outer.map_or(Pos2::ZERO, |r| r.center()) * ppp;
+        let probe = self.last_probe.unwrap_or_else(|| outer.map_or(Pos2::ZERO, |r| r.center()) * ppp);
         match platform::work_area(probe.x as i32, probe.y as i32) {
             Some([l, t, r, b]) => Rect::from_min_max(Pos2::new(l as f32, t as f32) / ppp, Pos2::new(r as f32, b as f32) / ppp),
             None => Rect::from_min_size(Pos2::ZERO, monitor - Vec2::new(0.0, 48.0)),
@@ -505,6 +606,13 @@ impl eframe::App for SnippyApp {
     /// on the UI thread — the worker thread never touches the window.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_updates(ctx);
+        self.handle_events(ctx);
+        // In tray-only mode the main window is hidden, but flyouts and the settings window
+        // are drawn from its frame: keep it painting while they're up.
+        if matches!(self.phase, Phase::Bar) && self.bar_hidden() && (self.flyout.is_some() || self.settings_open) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
         let Some(rx) = &self.capture_rx else { return };
         let result = match rx.try_recv() {
             Ok(r) => r,
@@ -566,6 +674,7 @@ fn main() -> eframe::Result<()> {
             .with_inner_size(bar::bar_size(&Settings::default()))
             .with_title("Snippy")
             .with_app_id("snippy")
+            .with_icon(app_icon())
             .with_decorations(false)
             .with_always_on_top()
             .with_transparent(true),
@@ -579,7 +688,17 @@ fn main() -> eframe::Result<()> {
             let app = SnippyApp::new(cc);
             // The window was created at the default size; fit it to the saved settings.
             cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(bar::bar_size(&app.settings)));
+            if app.bar_hidden() {
+                cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
             Ok(Box::new(app))
         }),
     )
+}
+
+fn app_icon() -> egui::IconData {
+    match tray::icon_rgba(ICON_PNG) {
+        Some((rgba, width, height)) => egui::IconData { rgba, width, height },
+        None => egui::IconData::default(),
+    }
 }
