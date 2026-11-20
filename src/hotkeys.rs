@@ -39,6 +39,15 @@ static WIN_SHIFT_S: AtomicBool = AtomicBool::new(false);
 /// Filled by the hook callback (never blocks: bounded + `try_send`).
 static QUEUE: OnceLock<SyncSender<Hotkey>> = OnceLock::new();
 
+/// A key-down starts a new press (fire!) unless it's auto-repeat of a press we're already
+/// handling. If the matching key-up was somehow missed, a gap longer than any auto-repeat
+/// interval also counts as a new press, so a shortcut can never get stuck.
+fn new_press(swallowing: &AtomicBool, last_down: &std::sync::atomic::AtomicU32, now: u32) -> bool {
+    let gap = now.wrapping_sub(last_down.swap(now, Ordering::Relaxed));
+    let was = swallowing.swap(true, Ordering::Relaxed);
+    !was || gap > 700
+}
+
 /// Enables/disables each shortcut (cheap; the hook stays installed).
 pub fn configure(print_screen: bool, win_shift_s: bool) {
     PRINT_SCREEN.store(print_screen, Ordering::Relaxed);
@@ -94,7 +103,7 @@ pub fn install(ctx: &egui::Context, tx: Sender<AppEvent>) {
 #[cfg(windows)]
 mod imp {
     use super::*;
-    use std::sync::atomic::{AtomicIsize, AtomicU32};
+    use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU8};
     use windows::core::w;
     use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::SystemInformation::GetTickCount;
@@ -176,43 +185,60 @@ mod imp {
             let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
             let down = wparam.0 as u32 == WM_KEYDOWN || wparam.0 as u32 == WM_SYSKEYDOWN;
             let injected = kb.flags.0 & LLKHF_INJECTED.0 != 0;
+            track_modifier(kb.vkCode, down);
             let is_prtsc = kb.vkCode == VK_SNAPSHOT.0 as u32;
-            let win = held(VK_LWIN) || held(VK_RWIN);
-            // Only the two shortcuts are ever looked at (and S only while Win is held).
-            let relevant = is_prtsc || (kb.vkCode == b'S' as u32 && win);
-            if !relevant {
+            let is_s = kb.vkCode == b'S' as u32;
+            if !is_prtsc && !is_s {
                 return CallNextHookEx(None, code, wparam, lparam);
             }
             let m = mods();
             let mut swallow = false;
             let mut fired = None;
             if !injected {
-                if down {
-                    HOOK_SAW.store(GetTickCount(), Ordering::Relaxed);
-                }
-                if is_prtsc && PRINT_SCREEN.load(Ordering::Relaxed) {
-                    // Plain Print Screen (Alt+PrtSc etc. keep their Windows behaviour).
-                    if down && m & (M_ALT | M_CTRL | M_SHIFT) == 0 {
-                        if !SWALLOWING_PRTSC.swap(true, Ordering::Relaxed) {
-                            fired = Some(fire(Hotkey::PrintScreen)); // once per press
-                        }
-                        swallow = true;
-                    } else if !down && SWALLOWING_PRTSC.swap(false, Ordering::Relaxed) {
-                        swallow = true;
+                let now = GetTickCount();
+                if is_prtsc {
+                    if down {
+                        HOOK_SAW.store(now, Ordering::Relaxed);
                     }
-                } else if !is_prtsc && WIN_SHIFT_S.load(Ordering::Relaxed) {
-                    if down && m & M_SHIFT != 0 && m & (M_CTRL | M_ALT) == 0 {
-                        if !SWALLOWING_S.swap(true, Ordering::Relaxed) {
+                    if PRINT_SCREEN.load(Ordering::Relaxed) {
+                        // Plain Print Screen (Alt+PrtSc etc. keep their Windows behaviour).
+                        if down && m & (M_ALT | M_CTRL | M_SHIFT) == 0 {
+                            if new_press(&SWALLOWING_PRTSC, &LAST_PRTSC_DOWN, now) {
+                                fired = Some(fire(Hotkey::PrintScreen));
+                            }
+                            swallow = true;
+                        } else if !down && SWALLOWING_PRTSC.swap(false, Ordering::Relaxed) {
+                            swallow = true;
+                        }
+                    }
+                } else if WIN_SHIFT_S.load(Ordering::Relaxed) {
+                    if down && m & M_WIN != 0 && m & M_SHIFT != 0 && m & (M_CTRL | M_ALT) == 0 {
+                        HOOK_SAW.store(now, Ordering::Relaxed);
+                        if new_press(&SWALLOWING_S, &LAST_S_DOWN, now) {
                             fired = Some(fire(Hotkey::WinShiftS));
                         }
                         suppress_start_menu();
                         swallow = true;
                     } else if !down && SWALLOWING_S.swap(false, Ordering::Relaxed) {
+                        // The S release ends the press even if Win was let go first.
                         swallow = true;
                     }
                 }
             }
-            record(KeyRecord { source: Source::Hook, prtsc: is_prtsc, down, mods: m, injected, swallowed: swallow, fired });
+            // Log Print Screen always; S only in a shortcut context (never plain typing).
+            if is_prtsc || m & M_WIN != 0 || swallow {
+                record(KeyRecord {
+                    source: Source::Hook,
+                    prtsc: is_prtsc,
+                    down,
+                    mods: m,
+                    async_mods: async_mods(),
+                    tracked_mods: tracked_mods(),
+                    injected,
+                    swallowed: swallow,
+                    fired,
+                });
+            }
             if swallow {
                 return LRESULT(1);
             }
@@ -220,12 +246,58 @@ mod imp {
         CallNextHookEx(None, code, wparam, lparam)
     }
 
+    static LAST_PRTSC_DOWN: AtomicU32 = AtomicU32::new(0);
+    static LAST_S_DOWN: AtomicU32 = AtomicU32::new(0);
+
     const M_SHIFT: u8 = 1;
     const M_CTRL: u8 = 2;
     const M_ALT: u8 = 4;
     const M_WIN: u8 = 8;
 
-    fn mods() -> u8 {
+    // Modifier state tracked from the key events the hook sees (left/right separately).
+    // Windows' GetAsyncKeyState can report a stale modifier (e.g. right after windows
+    // appear/disappear), which made Print Screen look like Shift+Print Screen and fall
+    // through to the Snipping Tool. A modifier counts as held only if BOTH agree.
+    static TRACKED: AtomicU8 = AtomicU8::new(0);
+
+    fn track_modifier(vk: u32, down: bool) {
+        let bit: u8 = match vk {
+            0xA0 => 1,   // VK_LSHIFT
+            0xA1 => 2,   // VK_RSHIFT
+            0xA2 => 4,   // VK_LCONTROL
+            0xA3 => 8,   // VK_RCONTROL
+            0xA4 => 16,  // VK_LMENU (Alt)
+            0xA5 => 32,  // VK_RMENU
+            0x5B => 64,  // VK_LWIN
+            0x5C => 128, // VK_RWIN
+            _ => return,
+        };
+        if down {
+            TRACKED.fetch_or(bit, Ordering::Relaxed);
+        } else {
+            TRACKED.fetch_and(!bit, Ordering::Relaxed);
+        }
+    }
+
+    fn tracked_mods() -> u8 {
+        let t = TRACKED.load(Ordering::Relaxed);
+        let mut m = 0;
+        if t & 3 != 0 {
+            m |= M_SHIFT;
+        }
+        if t & 12 != 0 {
+            m |= M_CTRL;
+        }
+        if t & 48 != 0 {
+            m |= M_ALT;
+        }
+        if t & 192 != 0 {
+            m |= M_WIN;
+        }
+        m
+    }
+
+    fn async_mods() -> u8 {
         let mut m = 0;
         if held(VK_SHIFT) {
             m |= M_SHIFT;
@@ -240,6 +312,11 @@ mod imp {
             m |= M_WIN;
         }
         m
+    }
+
+    /// Modifiers held according to both our own tracking and Windows.
+    fn mods() -> u8 {
+        tracked_mods() & async_mods()
     }
 
     // ── Diagnostics: the hook and the raw-input watcher queue small records (never
@@ -257,6 +334,8 @@ mod imp {
         prtsc: bool,
         down: bool,
         mods: u8,
+        async_mods: u8,
+        tracked_mods: u8,
         injected: bool,
         swallowed: bool,
         /// `Some(true)` = handed to Snippy; `Some(false)` = queue full; `None` = not fired.
@@ -296,9 +375,14 @@ mod imp {
                     let key = if r.prtsc { "Print Screen" } else { "S (Win held)" };
                     let line = match r.source {
                         Source::Hook => format!(
-                            "key: hook  {key} {}  mods={}{}  -> {}{}",
+                            "key: hook  {key} {}  mods={}{}{}  -> {}{}",
                             if r.down { "down" } else { "up" },
                             mods_text(r.mods),
+                            if r.async_mods != r.tracked_mods {
+                                format!(" (Windows says {}, keys say {})", mods_text(r.async_mods), mods_text(r.tracked_mods))
+                            } else {
+                                String::new()
+                            },
                             if r.injected { " (injected)" } else { "" },
                             if r.swallowed { "swallowed" } else { "PASSED THROUGH to Windows" },
                             match r.fired {
@@ -363,13 +447,9 @@ mod imp {
 
     /// Is `vk` (going down now) one of the shortcuts we're supposed to catch?
     fn is_our_shortcut(vk: u16) -> bool {
-        (vk == VK_SNAPSHOT.0 && PRINT_SCREEN.load(Ordering::Relaxed) && !held(VK_MENU) && !held(VK_CONTROL) && !held(VK_SHIFT))
-            || (vk == b'S' as u16
-                && WIN_SHIFT_S.load(Ordering::Relaxed)
-                && (held(VK_LWIN) || held(VK_RWIN))
-                && held(VK_SHIFT)
-                && !held(VK_CONTROL)
-                && !held(VK_MENU))
+        let m = mods();
+        (vk == VK_SNAPSHOT.0 && PRINT_SCREEN.load(Ordering::Relaxed) && m & (M_ALT | M_CTRL | M_SHIFT) == 0)
+            || (vk == b'S' as u16 && WIN_SHIFT_S.load(Ordering::Relaxed) && m & M_WIN != 0 && m & M_SHIFT != 0 && m & (M_CTRL | M_ALT) == 0)
     }
 
     /// Raw input watcher: sees every key regardless of hooks. If one of our shortcuts went
@@ -388,13 +468,15 @@ mod imp {
             if got != u32::MAX && raw.header.dwType == RIM_TYPEKEYBOARD.0 {
                 let kb = raw.data.keyboard;
                 let key_down = (kb.Flags as u32 & RI_KEY_BREAK) == 0;
-                let win = held(VK_LWIN) || held(VK_RWIN);
+                let win = mods() & M_WIN != 0;
                 if key_down && (kb.VKey == VK_SNAPSHOT.0 || (kb.VKey == b'S' as u16 && win)) {
                     record(KeyRecord {
                         source: Source::Raw,
                         prtsc: kb.VKey == VK_SNAPSHOT.0,
                         down: true,
                         mods: mods(),
+                        async_mods: async_mods(),
+                        tracked_mods: tracked_mods(),
                         injected: false,
                         swallowed: false,
                         fired: None,
@@ -467,5 +549,52 @@ mod imp {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    /// Simulates the hook's handling of one key: `down(t)` returns whether it fires.
+    struct Key {
+        swallowing: AtomicBool,
+        last: AtomicU32,
+    }
+    impl Key {
+        fn new() -> Self {
+            Key { swallowing: AtomicBool::new(false), last: AtomicU32::new(0) }
+        }
+        fn down(&self, t: u32) -> bool {
+            new_press(&self.swallowing, &self.last, t)
+        }
+        fn up(&self) {
+            self.swallowing.store(false, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn fires_once_per_press_not_on_auto_repeat() {
+        let k = Key::new();
+        assert!(k.down(10_000));
+        // held: auto-repeat after ~500 ms, then every ~33 ms
+        assert!(!k.down(10_500));
+        assert!(!k.down(10_533));
+        assert!(!k.down(10_566));
+        k.up();
+        assert!(k.down(11_200)); // next real press
+    }
+
+    #[test]
+    fn missed_key_up_cannot_get_stuck() {
+        // The v0.7.5 bug: the S release went unseen (Win let go first), so every later
+        // press looked like auto-repeat. A pause longer than auto-repeat = a new press.
+        let k = Key::new();
+        assert!(k.down(20_000));
+        // no up() — key-up missed
+        assert!(k.down(23_000));
+        assert!(k.down(26_800));
+        assert!(!k.down(26_833)); // but real auto-repeat still doesn't re-fire
     }
 }
