@@ -212,7 +212,7 @@ mod imp {
                         }
                     }
                 } else if WIN_SHIFT_S.load(Ordering::Relaxed) {
-                    if down && m & M_WIN != 0 && m & M_SHIFT != 0 && m & (M_CTRL | M_ALT) == 0 {
+                    if down && is_win_shift_s_combo() {
                         HOOK_SAW.store(now, Ordering::Relaxed);
                         if new_press(&SWALLOWING_S, &LAST_S_DOWN, now) {
                             fired = Some(fire(Hotkey::WinShiftS));
@@ -226,7 +226,7 @@ mod imp {
                 }
             }
             // Log Print Screen always; S only in a shortcut context (never plain typing).
-            if is_prtsc || m & M_WIN != 0 || swallow {
+            if is_prtsc || any_mods() & M_WIN != 0 || swallow {
                 record(KeyRecord {
                     source: Source::Hook,
                     prtsc: is_prtsc,
@@ -314,9 +314,24 @@ mod imp {
         m
     }
 
-    /// Modifiers held according to both our own tracking and Windows.
+    /// Modifiers held according to both our own tracking and Windows. Used to *exclude*
+    /// combinations (e.g. Shift+Print Screen), so a stale reading can't block a shortcut.
     fn mods() -> u8 {
         tracked_mods() & async_mods()
+    }
+
+    /// Modifiers held according to either source. Used where a modifier is *required*:
+    /// keyboards with a dedicated snip key (e.g. Microsoft Designer Compact) send
+    /// Win, Shift and S in one burst, and Windows' own state can lag behind it, while the
+    /// hook has already seen the Win and Shift key-downs.
+    fn any_mods() -> u8 {
+        tracked_mods() | async_mods()
+    }
+
+    /// Win+Shift+S: Win and Shift held (either source), Ctrl/Alt not held (both agree).
+    fn is_win_shift_s_combo() -> bool {
+        let need = any_mods();
+        need & M_WIN != 0 && need & M_SHIFT != 0 && mods() & (M_CTRL | M_ALT) == 0
     }
 
     // ── Diagnostics: the hook and the raw-input watcher queue small records (never
@@ -449,7 +464,7 @@ mod imp {
     fn is_our_shortcut(vk: u16) -> bool {
         let m = mods();
         (vk == VK_SNAPSHOT.0 && PRINT_SCREEN.load(Ordering::Relaxed) && m & (M_ALT | M_CTRL | M_SHIFT) == 0)
-            || (vk == b'S' as u16 && WIN_SHIFT_S.load(Ordering::Relaxed) && m & M_WIN != 0 && m & M_SHIFT != 0 && m & (M_CTRL | M_ALT) == 0)
+            || (vk == b'S' as u16 && WIN_SHIFT_S.load(Ordering::Relaxed) && is_win_shift_s_combo())
     }
 
     /// Raw input watcher: sees every key regardless of hooks. If one of our shortcuts went
@@ -468,7 +483,7 @@ mod imp {
             if got != u32::MAX && raw.header.dwType == RIM_TYPEKEYBOARD.0 {
                 let kb = raw.data.keyboard;
                 let key_down = (kb.Flags as u32 & RI_KEY_BREAK) == 0;
-                let win = mods() & M_WIN != 0;
+                let win = any_mods() & M_WIN != 0;
                 if key_down && (kb.VKey == VK_SNAPSHOT.0 || (kb.VKey == b'S' as u16 && win)) {
                     record(KeyRecord {
                         source: Source::Raw,

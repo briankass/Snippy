@@ -189,7 +189,7 @@ impl SnippyApp {
             row(ui, Icon::Keyboard, "Print Screen opens Snippy", "Instead of the Windows Snipping Tool (Alt+Print Screen keeps its usual job)", |ui| {
                 changed |= toggle(ui, &mut self.settings.hotkey_print_screen).changed();
             });
-            row(ui, Icon::Keyboard, "Windows + Shift + S opens Snippy", "Replaces the Snipping Tool shortcut, so you can uninstall the Snipping Tool if you like", |ui| {
+            row(ui, Icon::Keyboard, "Windows + Shift + S opens Snippy", "Also the screenshot key on keyboards that send this combo (e.g. Microsoft Designer Compact). Replaces the Snipping Tool shortcut", |ui| {
                 changed |= toggle(ui, &mut self.settings.hotkey_win_shift_s).changed();
             });
             if cfg!(windows) {
