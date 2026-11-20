@@ -243,7 +243,11 @@ pub fn run(target: ScrollTarget, stop: Arc<AtomicBool>, progress: Arc<AtomicU32>
         .ok_or("monitor not found")?;
     let [x, y, w, h] = target.region;
     let grab = || monitor.capture_region(x, y, w, h).map_err(|e| e.to_string());
-    let center = (target.origin.0 + (x + w / 2) as i32, target.origin.1 + (y + h / 2) as i32);
+    // Where the pointer sits while scrolling: near the right edge of the area (usually the
+    // scrollbar or a margin), not the middle, where it would hover links and make the
+    // browser show their address in the corner of every frame.
+    let inset = 6.min(w / 2);
+    let center = (target.origin.0 + (x + w - 1 - inset) as i32, target.origin.1 + (y + h / 2) as i32);
     let restore = input::cursor_pos();
     let max_h = (MAX_BYTES / (w as u64 * 4).max(1)).min(60_000) as usize;
 
