@@ -32,7 +32,8 @@ executable: no installer, no runtime dependencies.
 - Snippy's own windows never appear in your screenshots or recordings
 
 **Shortcuts & tray**
-- **Print Screen** and **Windows + Shift + S** open Snippy instead of the Windows Snipping
+- **Print Screen** and **Windows + Shift + S** bring up the Snippy bar (or, if you prefer, start a
+  snip right away) instead of the Windows Snipping
   Tool (each can be turned off in Settings)
 - System tray icon with quick snip / record actions; optional tray-only mode that hides the bar
 

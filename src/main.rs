@@ -93,6 +93,15 @@ impl Default for Look {
     }
 }
 
+/// What Print Screen / Win+Shift+S do.
+#[derive(PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize)]
+enum ShortcutAction {
+    /// Bring up the floating bar so you can pick what to capture.
+    ShowBar,
+    /// Start a snip right away.
+    Snip,
+}
+
 /// Everything remembered between runs.
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
@@ -120,6 +129,7 @@ struct Settings {
     hide_bar: bool,
     hotkey_print_screen: bool,
     hotkey_win_shift_s: bool,
+    shortcut_action: ShortcutAction,
 }
 
 impl Default for Settings {
@@ -145,6 +155,7 @@ impl Default for Settings {
             hide_bar: false,
             hotkey_print_screen: true,
             hotkey_win_shift_s: true,
+            shortcut_action: ShortcutAction::ShowBar,
         }
     }
 }
@@ -179,6 +190,8 @@ struct SnippyApp {
     startup: Option<bool>,
     prefs_status: String,
     tray: Option<tray::Tray>,
+    /// Tray-only mode, but the bar was brought up by a shortcut (until the next capture).
+    bar_revealed: bool,
     /// Physical-pixel point on the monitor of the last capture (for placing the flyout).
     last_probe: Option<Pos2>,
     events_tx: mpsc::Sender<AppEvent>,
@@ -216,6 +229,7 @@ impl SnippyApp {
             prefs_status: String::new(),
             tray: None,
             last_probe: None,
+            bar_revealed: false,
             events_tx,
             events_rx,
         };
@@ -250,7 +264,22 @@ impl SnippyApp {
 
     /// Bar hidden in tray-only mode.
     fn bar_hidden(&self) -> bool {
-        self.settings.hide_bar && self.tray.is_some()
+        self.settings.hide_bar && self.tray.is_some() && !self.bar_revealed
+    }
+
+    /// Shows the bar (even in tray-only mode) and brings it to the front.
+    fn reveal_bar(&mut self, ctx: &egui::Context) {
+        match self.phase {
+            Phase::Bar => {
+                self.bar_revealed = true;
+                self.show_bar(ctx);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+            // The editor is the same window; just bring it forward.
+            Phase::Editor => ctx.send_viewport_cmd(egui::ViewportCommand::Focus),
+            // Busy capturing / selecting / recording: ignore.
+            _ => {}
+        }
     }
 
     fn handle_events(&mut self, ctx: &egui::Context) {
@@ -262,8 +291,9 @@ impl SnippyApp {
                 app.start_capture(ctx, Purpose::Snip);
             };
             match ev {
-                // Win+Shift+S always snips a region (like Windows); Print Screen uses the
-                // mode selected on the bar.
+                AppEvent::Hotkey(_) if self.settings.shortcut_action == ShortcutAction::ShowBar => self.reveal_bar(ctx),
+                // "Start a snip": Win+Shift+S snips a region (like Windows); Print Screen uses
+                // the mode selected on the bar.
                 AppEvent::Hotkey(hotkeys::Hotkey::WinShiftS) => snip(self, Some(CaptureMode::Region)),
                 AppEvent::Hotkey(hotkeys::Hotkey::PrintScreen) => snip(self, None),
                 AppEvent::Tray(cmd) => match cmd {
@@ -272,7 +302,11 @@ impl SnippyApp {
                     tray::TrayCmd::SnipScreen => snip(self, Some(CaptureMode::FullScreen)),
                     tray::TrayCmd::Record => self.start_capture(ctx, Purpose::Record),
                     tray::TrayCmd::ToggleBar => {
-                        self.settings.hide_bar = !self.settings.hide_bar;
+                        if self.bar_revealed {
+                            self.bar_revealed = false; // shown by a shortcut: tuck it away again
+                        } else {
+                            self.settings.hide_bar = !self.settings.hide_bar;
+                        }
                         if matches!(self.phase, Phase::Bar) {
                             self.show_bar(ctx);
                             if !self.bar_hidden() {
@@ -389,6 +423,7 @@ impl SnippyApp {
         }
         self.flyout = None;
         self.tip = None;
+        self.bar_revealed = false; // tray-only mode: the bar goes away again after this capture
 
         // Capture the monitor under the mouse pointer (that's the bar's monitor when the bar
         // was clicked; for shortcuts and the tray it's where the user is working).

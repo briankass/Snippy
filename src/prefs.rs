@@ -192,12 +192,16 @@ impl SnippyApp {
             row(ui, Icon::Keyboard, "Windows + Shift + S opens Snippy", "Replaces the Snipping Tool shortcut, so you can uninstall the Snipping Tool if you like", |ui| {
                 changed |= toggle(ui, &mut self.settings.hotkey_win_shift_s).changed();
             });
+            row(ui, Icon::Region, "When a shortcut is pressed", "Show the bar to pick what to capture, or start snipping right away", |ui| {
+                ui.selectable_value(&mut self.settings.shortcut_action, ShortcutAction::Snip, "Start a snip");
+                ui.selectable_value(&mut self.settings.shortcut_action, ShortcutAction::ShowBar, "Show the bar");
+            });
             if changed {
                 hotkeys::configure(self.settings.hotkey_print_screen, self.settings.hotkey_win_shift_s);
             }
             ui.add(egui::Label::new(RichText::new(
-                "Windows + Shift + S snips a region; Print Screen uses the mode selected on the bar. \
-                 Both capture the monitor under the mouse pointer. \
+                "\"Show the bar\" brings the bar to the front (also in tray-only mode, until your next capture). \
+                 \"Start a snip\": Windows + Shift + S snips a region, Print Screen uses the mode selected on the bar. \
                  Windows doesn't pass keys to Snippy while an app running as administrator is in front.",
             ).size(11.0).weak()).wrap());
         });
