@@ -17,6 +17,7 @@ mod hotkeys;
 mod icons;
 #[cfg(windows)]
 mod mf;
+mod ocr;
 mod overlay;
 mod platform;
 mod prefs;
