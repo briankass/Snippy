@@ -194,6 +194,7 @@ mod imp {
             if !is_prtsc && !is_s {
                 return CallNextHookEx(None, code, wparam, lparam);
             }
+            resync_tracked();
             let m = mods();
             let mut swallow = false;
             let mut fired = None;
@@ -277,9 +278,56 @@ mod imp {
         };
         if down {
             TRACKED.fetch_or(bit, Ordering::Relaxed);
+            LAST_MOD_DOWN.store(unsafe { GetTickCount() }, Ordering::Relaxed);
+            LAST_MOD_DOWN_BITS.fetch_or(bit, Ordering::Relaxed);
         } else {
             TRACKED.fetch_and(!bit, Ordering::Relaxed);
+            LAST_MOD_DOWN_BITS.fetch_and(!bit, Ordering::Relaxed);
         }
+    }
+
+    /// When a modifier last went down (for the "fast burst" allowance).
+    static LAST_MOD_DOWN: AtomicU32 = AtomicU32::new(0);
+    static LAST_MOD_DOWN_BITS: AtomicU8 = AtomicU8::new(0);
+    /// How long after a modifier key-down our own tracking may vouch for it.
+    const BURST_MS: u32 = 300;
+
+    /// Collapses left/right bits into M_* flags.
+    fn collapse(t: u8) -> u8 {
+        let mut m = 0;
+        if t & 3 != 0 {
+            m |= M_SHIFT;
+        }
+        if t & 12 != 0 {
+            m |= M_CTRL;
+        }
+        if t & 48 != 0 {
+            m |= M_ALT;
+        }
+        if t & 192 != 0 {
+            m |= M_WIN;
+        }
+        m
+    }
+
+    /// Left/right modifier bits according to Windows.
+    fn async_lr() -> u8 {
+        let mut t = 0;
+        for (i, vk) in [0xA0u16, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C].into_iter().enumerate() {
+            if held(VIRTUAL_KEY(vk)) {
+                t |= 1 << i;
+            }
+        }
+        t
+    }
+
+    /// Drops tracked modifiers Windows says aren't held, unless they just went down (a
+    /// fast burst Windows hasn't caught up with yet). Run periodically so a missed
+    /// key-up can never leave a modifier "stuck".
+    fn resync_tracked() {
+        let recent = unsafe { GetTickCount() }.wrapping_sub(LAST_MOD_DOWN.load(Ordering::Relaxed)) <= BURST_MS;
+        let keep = async_lr() | if recent { LAST_MOD_DOWN_BITS.load(Ordering::Relaxed) } else { 0 };
+        TRACKED.fetch_and(keep, Ordering::Relaxed);
     }
 
     fn tracked_mods() -> u8 {
@@ -328,10 +376,15 @@ mod imp {
     /// Win, Shift and S in one burst, and Windows' own state can lag behind it, while the
     /// hook has already seen the Win and Shift key-downs.
     fn any_mods() -> u8 {
-        tracked_mods() | async_mods()
+        // Our tracking may only *add* a modifier during a fast burst (it went down within
+        // BURST_MS). Otherwise Windows decides — so a stale tracked modifier (missed
+        // key-up) can never turn a plain "S" into Win+Shift+S.
+        let recent = unsafe { GetTickCount() }.wrapping_sub(LAST_MOD_DOWN.load(Ordering::Relaxed)) <= BURST_MS;
+        let burst = if recent { collapse(LAST_MOD_DOWN_BITS.load(Ordering::Relaxed) & TRACKED.load(Ordering::Relaxed)) } else { 0 };
+        async_mods() | burst
     }
 
-    /// Win+Shift+S: Win and Shift held (either source), Ctrl/Alt not held (both agree).
+    /// Win+Shift+S: Win and Shift held (Windows, or a just-pressed burst), Ctrl/Alt not held.
     fn is_win_shift_s_combo() -> bool {
         let need = any_mods();
         need & M_WIN != 0 && need & M_SHIFT != 0 && mods() & (M_CTRL | M_ALT) == 0
@@ -596,6 +649,7 @@ mod imp {
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             if msg.message == WM_TIMER && msg.hwnd.0.is_null() {
                 reinstall();
+                resync_tracked();
                 continue;
             }
             let _ = TranslateMessage(&msg);
