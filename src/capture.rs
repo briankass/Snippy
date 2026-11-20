@@ -33,13 +33,12 @@ pub(crate) struct Capture {
     pub(crate) purpose: Purpose,
     pub(crate) mode: CaptureMode,
     pub(crate) screens: Vec<Screen>,
-    /// The screen under the mouse pointer when the capture started.
-    pub(crate) cursor_screen: usize,
     /// Top-most first. Only filled in Window mode.
     pub(crate) windows: Vec<WindowHit>,
 }
 
 /// Index of the screen containing `p` (physical pixels), else the first one.
+#[allow(dead_code)] // used by tests; handy for multi-monitor logic
 pub(crate) fn screen_at(screens: &[Screen], p: Option<Pos2>) -> usize {
     p.and_then(|p| screens.iter().position(|s| s.bounds().contains(p))).unwrap_or(0)
 }
@@ -47,21 +46,48 @@ pub(crate) fn screen_at(screens: &[Screen], p: Option<Pos2>) -> usize {
 /// Captures all monitors. `probe` (physical pixels, usually the mouse pointer) picks the
 /// "current" screen.
 pub(crate) fn capture(purpose: Purpose, mode: CaptureMode, probe: Option<Pos2>) -> Result<Capture, String> {
-    let mut monitors = Monitor::all().map_err(|e| e.to_string())?;
-    // Primary first, so index 0 is a sensible fallback.
-    monitors.sort_by_key(|m| !m.is_primary().unwrap_or(false));
-
+    // Capture all monitors in parallel (each grab can take tens of ms on big screens).
+    // Every thread looks its monitor up by id (monitor handles aren't shareable across threads).
+    let ids: Vec<(Option<u32>, bool)> = Monitor::all()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .map(|m| (m.id().ok(), m.is_primary().unwrap_or(false)))
+        .collect();
+    let results: Vec<(bool, Result<Screen, String>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, &(id, primary))| {
+                scope.spawn(move || {
+                    let grab = || -> Result<Screen, String> {
+                        let all = Monitor::all().map_err(|e| e.to_string())?;
+                        let m = match id {
+                            Some(id) => all.into_iter().find(|m| m.id().ok() == Some(id)),
+                            None => all.into_iter().nth(i),
+                        }
+                        .ok_or("monitor disappeared")?;
+                        Ok(Screen {
+                            monitor_id: m.id().ok(),
+                            origin: Pos2::new(m.x().unwrap_or(0) as f32, m.y().unwrap_or(0) as f32),
+                            scale: m.scale_factor().unwrap_or(1.0).max(0.5),
+                            image: m.capture_image().map_err(|e| e.to_string())?,
+                        })
+                    };
+                    (primary, grab())
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap_or((false, Err("capture thread crashed".into())))).collect()
+    });
+    // Primary first, so index 0 is a sensible fallback. (Moved, not copied: images are big.)
+    let (mut ordered, mut others): (Vec<_>, Vec<_>) = results.into_iter().partition(|(primary, _)| *primary);
+    ordered.append(&mut others);
     let mut screens = Vec::new();
     let mut last_err = None;
-    for m in &monitors {
-        match m.capture_image() {
-            Ok(image) => screens.push(Screen {
-                monitor_id: m.id().ok(),
-                origin: Pos2::new(m.x().unwrap_or(0) as f32, m.y().unwrap_or(0) as f32),
-                scale: m.scale_factor().unwrap_or(1.0).max(0.5),
-                image,
-            }),
-            Err(e) => last_err = Some(e.to_string()),
+    for (_, r) in ordered {
+        match r {
+            Ok(s) => screens.push(s),
+            Err(e) => last_err = Some(e),
         }
     }
     if screens.is_empty() {
@@ -70,8 +96,8 @@ pub(crate) fn capture(purpose: Purpose, mode: CaptureMode, probe: Option<Pos2>) 
     #[cfg(debug_assertions)]
     split_for_testing(&mut screens);
     let windows = if mode == CaptureMode::Window { list_windows() } else { Vec::new() };
-    let cursor_screen = screen_at(&screens, probe);
-    Ok(Capture { purpose, mode, screens, cursor_screen, windows })
+    let _ = probe;
+    Ok(Capture { purpose, mode, screens, windows })
 }
 
 /// Debug builds only: `SNIPPY_SPLIT_SCREENS=1` pretends a single monitor is two side-by-side

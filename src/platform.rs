@@ -166,8 +166,12 @@ mod imp {
     /// Puts the window titled `title` exactly at `rect` (physical pixels). Checked every
     /// call, which also corrects the resize Windows applies when a window lands on a monitor
     /// with different display scaling.
-    pub fn place_window(title: &str, [l, t, r, b]: PxRect) -> bool {
-        let Some(h) = find_window(title) else { return false };
+    pub fn place_window(title: &str, rect: PxRect) -> bool {
+        find_window(title).is_some_and(|h| place_hwnd(h, rect))
+    }
+
+    /// Like [`place_window`], by handle.
+    pub fn place_hwnd(h: Hwnd, [l, t, r, b]: PxRect) -> bool {
         let h = hwnd(h);
         unsafe {
             let mut cur = RECT::default();
@@ -281,6 +285,9 @@ mod imp {
     pub fn place_window(_title: &str, _rect: PxRect) -> bool {
         false
     }
+    pub fn place_hwnd(_h: Hwnd, _rect: PxRect) -> bool {
+        false
+    }
     pub fn move_window(_h: Hwnd, _x: i32, _y: i32) {}
     pub fn window_rect(_h: Hwnd) -> Option<PxRect> {
         None
@@ -302,7 +309,7 @@ mod imp {
 }
 
 pub use imp::{
-    find_window, known_folder, move_window, place_window, refresh_startup_path, set_startup, startup_enabled, style_window,
+    find_window, known_folder, move_window, place_hwnd, place_window, refresh_startup_path, set_startup, startup_enabled, style_window,
     window_rect, work_area,
 };
 

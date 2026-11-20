@@ -191,6 +191,11 @@ struct SnippyApp {
     startup: Option<bool>,
     prefs_status: String,
     tray: Option<tray::Tray>,
+    /// Where the bar was before a capture took over the main window: (physical pixels,
+    /// points). Restored afterwards.
+    saved_pos: Option<(Option<platform::PxRect>, Option<Pos2>)>,
+    /// The glass backdrop is switched off while the overlay covers the desktop.
+    overlay_unstyled: bool,
     /// Tray-only mode, but the bar was brought up by a shortcut (until the next capture).
     bar_revealed: bool,
     /// Physical-pixel point on the monitor of the last capture (for placing the flyout).
@@ -231,6 +236,8 @@ impl SnippyApp {
             tray: None,
             last_probe: None,
             bar_revealed: false,
+            saved_pos: None,
+            overlay_unstyled: false,
             events_tx,
             events_rx,
         };
@@ -377,6 +384,7 @@ impl SnippyApp {
 impl SnippyApp {
     fn show_bar(&mut self, ctx: &egui::Context) {
         self.phase = Phase::Bar;
+        self.restore_main(ctx);
         if self.bar_hidden() {
             ghost_main(ctx);
             return;
@@ -391,6 +399,7 @@ impl SnippyApp {
 
     /// Back to the editor if one is open, otherwise to the bar.
     fn show_home(&mut self, ctx: &egui::Context) {
+        self.restore_main(ctx);
         if let Some(ed) = &self.editor {
             self.phase = Phase::Editor;
             let (ppp, monitor) = ctx.input(|i| {
@@ -411,12 +420,59 @@ impl SnippyApp {
         }
     }
 
-    /// Shows the selection overlay on every monitor (one window each). The main window
-    /// becomes an invisible "ghost" that hosts them.
+    /// Shows the selection overlay: the main window is stretched over every monitor.
     fn show_overlay(&mut self, ctx: &egui::Context, cap: Capture) {
-        self.phase = Phase::Overlay(Overlay::new(ctx, cap));
-        ghost_main(ctx);
-        ctx.request_repaint();
+        let ov = Overlay::new(ctx, cap);
+        let desktop = ov.desktop();
+        self.phase = Phase::Overlay(ov);
+        if let Some(h) = self.main_hwnd {
+            // No glass behind the overlay (it would flash before the first frame).
+            platform::style_window(h, Backdrop::Off);
+            self.overlay_unstyled = true;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+        ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
+        self.cover_desktop(ctx, desktop);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    /// Places the main window over `desktop` (physical pixels). On Windows this is done in
+    /// physical pixels and re-checked every frame (Windows resizes a window when its DPI
+    /// changes); elsewhere through egui in points.
+    fn cover_desktop(&self, ctx: &egui::Context, desktop: Rect) {
+        let r = [desktop.min.x, desktop.min.y, desktop.max.x, desktop.max.y].map(|v| v.round() as i32);
+        if self.main_hwnd.is_some_and(|h| platform::place_hwnd(h, r)) {
+            return;
+        }
+        let ppp = ctx.input(|i| i.viewport().native_pixels_per_point.unwrap_or(1.0));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(desktop.min / ppp));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desktop.size() / ppp));
+    }
+
+    /// After a capture: put the window back where the bar was and restore the glass.
+    fn restore_main(&mut self, ctx: &egui::Context) {
+        if let Some((phys, points)) = self.saved_pos.take() {
+            match (self.main_hwnd, phys) {
+                // Position *and* size in one step, so the desktop-sized window never
+                // flashes at the bar's spot.
+                (Some(h), Some(r)) => {
+                    platform::place_hwnd(h, r);
+                }
+                _ => {
+                    if let Some(p) = points {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(p));
+                    }
+                }
+            }
+        }
+        if self.overlay_unstyled {
+            self.overlay_unstyled = false;
+            if let Some(h) = self.main_hwnd {
+                self.glass = platform::style_window(h, self.settings.look.backdrop);
+            }
+        }
     }
 
     /// Acts on a choice made in the overlay.
@@ -474,6 +530,16 @@ impl SnippyApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        self.center_on_capture_monitor(size);
+    }
+
+    /// Centres a main window of `size` points on the monitor of the last capture.
+    fn center_on_capture_monitor(&self, size: Vec2) {
+        let (Some(h), Some(p)) = (self.main_hwnd, self.last_probe) else { return };
+        let Some([l, t, r, b]) = platform::work_area(p.x as i32, p.y as i32) else { return };
+        let scale = Monitor::from_point(p.x as i32, p.y as i32).ok().and_then(|m| m.scale_factor().ok()).unwrap_or(1.0);
+        let (w, hgt) = ((size.x * scale) as i32, (size.y * scale) as i32);
+        platform::move_window(h, l + ((r - l - w) / 2).max(0), t + ((b - t - hgt) / 2).max(0));
     }
 
     fn start_snip(&mut self, ctx: &egui::Context) {
@@ -497,6 +563,11 @@ impl SnippyApp {
             })
         });
         self.last_probe = probe;
+        if self.saved_pos.is_none() {
+            let phys = self.main_hwnd.and_then(platform::window_rect);
+            let points = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min));
+            self.saved_pos = Some((phys, points));
+        }
         let mode = self.settings.mode;
         // For snips the delay happens before the screenshot; for recordings it's a
         // countdown after you've picked the area.
@@ -511,7 +582,10 @@ impl SnippyApp {
 
         std::thread::spawn(move || {
             // Let the OS finish hiding us (and any fade animation), plus the user's delay.
-            std::thread::sleep(Duration::from_millis(300) + Duration::from_secs(delay));
+            // On Windows Snippy's windows are excluded from capture, so only a short pause is
+            // needed; elsewhere give the bar time to disappear.
+            let settle = if cfg!(windows) { 120 } else { 300 };
+            std::thread::sleep(Duration::from_millis(settle) + Duration::from_secs(delay));
             let _ = tx.send(capture(purpose, mode, probe));
             // eframe calls `App::logic` while hidden when a repaint is requested.
             ctx.request_repaint();
@@ -671,6 +745,7 @@ impl SnippyApp {
         let path = dir.join(format!("Recording {}.mp4", timestamp()));
         let recorder = Recorder::start(target, opts, path);
         self.phase = Phase::Recording { recorder, border };
+        self.restore_main(ctx);
 
         // The mini bar stays visible while recording; it's excluded from capture.
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
@@ -738,11 +813,20 @@ impl eframe::App for SnippyApp {
         let ctx = ui.ctx().clone();
         let ghost = self.bar_hidden();
         match &mut self.phase {
-            Phase::Overlay(overlay) => match overlay.show(&ctx) {
-                Some(OverlayOutcome::Selected { screen, px }) => self.overlay_selected(&ctx, screen, px),
-                Some(OverlayOutcome::Cancel) => self.show_home(&ctx),
-                None => {}
-            },
+            Phase::Overlay(overlay) => {
+                // Keep covering the desktop (corrects Windows' DPI-change resize).
+                let desktop = overlay.desktop();
+                let r = [desktop.min.x, desktop.min.y, desktop.max.x, desktop.max.y].map(|v| v.round() as i32);
+                if let Some(h) = self.main_hwnd {
+                    platform::place_hwnd(h, r);
+                }
+                let outcome = overlay.ui(ui);
+                match outcome {
+                    Some(OverlayOutcome::Selected { screen, px }) => self.overlay_selected(&ctx, screen, px),
+                    Some(OverlayOutcome::Cancel) => self.show_home(&ctx),
+                    None => {}
+                }
+            }
             // Tray-only mode: the main window is a ghost; draw nothing in it.
             Phase::Bar if ghost => {}
             Phase::Bar | Phase::Capturing => self.bar_ui(ui),
