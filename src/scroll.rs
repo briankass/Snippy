@@ -18,30 +18,48 @@ const MAX_STEPS: usize = 400;
 /// Columns at the right edge ignored when matching (scrollbars move independently).
 const SCROLLBAR_PX: u32 = 24;
 
-/// Per-row fingerprint: (hash, informative). "Informative" rows have some detail; blank
-/// rows match anything, so they don't count as evidence when aligning frames.
-pub type Sig = (u64, bool);
+/// Number of column bins in a row signature.
+const BINS: usize = 64;
+/// Mean per-bin difference (0-255 luma) under which two rows count as the same.
+/// Browsers don't re-render scrolled content bit-for-bit identically (anti-aliasing,
+/// colour-managed images, fractional display scaling), so matching must be tolerant.
+const MATCH_TOL: u32 = 4;
+/// Tolerance for "this row didn't change at all" (sticky bands, end of page).
+const SAME_TOL: u32 = 2;
+
+/// Per-row fingerprint: the average brightness of `BINS` column bins, and whether the row
+/// is "informative" (has some detail; blank rows match anything, so they aren't evidence).
+#[derive(Clone)]
+pub struct Sig {
+    bins: [u8; BINS],
+    info: bool,
+}
+
+/// Mean absolute per-bin difference between two rows.
+fn dist(a: &Sig, b: &Sig) -> u32 {
+    a.bins.iter().zip(&b.bins).map(|(&x, &y)| x.abs_diff(y) as u32).sum::<u32>() / BINS as u32
+}
 
 pub fn signatures(img: &RgbaImage) -> Vec<Sig> {
-    let w = img.width();
-    let core_end = if w > SCROLLBAR_PX * 3 { w - SCROLLBAR_PX } else { w };
+    let w = img.width() as usize;
+    let core = if w > SCROLLBAR_PX as usize * 3 { w - SCROLLBAR_PX as usize } else { w };
     let raw = img.as_raw();
-    let stride = w as usize * 4;
+    let stride = w * 4;
+    let nb = BINS.min(core.max(1));
     (0..img.height() as usize)
         .map(|y| {
-            let row = &raw[y * stride..y * stride + core_end as usize * 4];
-            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-            let first = [row[0] >> 4, row[1] >> 4, row[2] >> 4];
-            let mut varied = false;
-            for px in row.chunks_exact(4).step_by(2) {
-                // Ignore tiny differences (anti-aliasing noise): compare at 4 bits/channel.
-                let q = [px[0] >> 4, px[1] >> 4, px[2] >> 4];
-                varied |= q != first;
-                for v in q {
-                    h = (h ^ v as u64).wrapping_mul(0x0100_0000_01b3);
-                }
+            let row = &raw[y * stride..y * stride + core * 4];
+            let mut bins = [0u8; BINS];
+            for (j, bin) in bins.iter_mut().enumerate().take(nb) {
+                let (c0, c1) = (j * core / nb, ((j + 1) * core / nb).max(j * core / nb + 1));
+                let sum: u32 = row[c0 * 4..c1 * 4]
+                    .chunks_exact(4)
+                    .map(|p| (p[0] as u32 * 77 + p[1] as u32 * 150 + p[2] as u32 * 29) >> 8)
+                    .sum();
+                *bin = (sum / (c1 - c0) as u32) as u8;
             }
-            (h, varied)
+            let (mn, mx) = bins[..nb].iter().fold((255u8, 0u8), |(a, b), &v| (a.min(v), b.max(v)));
+            Sig { bins, info: mx - mn >= 6 }
         })
         .collect()
 }
@@ -52,11 +70,12 @@ pub fn signatures(img: &RgbaImage) -> Vec<Sig> {
 pub fn fixed_bands(a: &[Sig], b: &[Sig]) -> Option<(usize, usize)> {
     let h = a.len().min(b.len());
     let cap = h * 35 / 100;
-    let top = (0..h).take_while(|&i| a[i].0 == b[i].0).count();
+    let same = |i: usize| dist(&a[i], &b[i]) <= SAME_TOL;
+    let top = (0..h).take_while(|&i| same(i)).count();
     if top >= h.saturating_sub(4) {
         return None; // nothing moved
     }
-    let bottom = (0..h).take_while(|&i| a[h - 1 - i].0 == b[h - 1 - i].0).count();
+    let bottom = (0..h).take_while(|&i| same(h - 1 - i)).count();
     Some((top.min(cap), bottom.min(cap)))
 }
 
@@ -70,50 +89,78 @@ pub enum Shift {
     Lost,
 }
 
+/// Best candidate alignment, for the diagnostics log.
+#[derive(Clone, Copy)]
+pub struct Match {
+    pub shift: usize,
+    /// Percentage of informative overlapping rows that matched.
+    pub percent: usize,
+    /// Informative rows compared.
+    pub rows: usize,
+}
+
+impl std::fmt::Debug for Match {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "shift {} matched {}% of {} rows", self.shift, self.percent, self.rows)
+    }
+}
+
 /// How far the content moved from `a` to `b`, ignoring the fixed bands.
 pub fn find_shift(a: &[Sig], b: &[Sig], top: usize, bottom: usize) -> Shift {
+    analyse(a, b, top, bottom).0
+}
+
+/// `find_shift`, plus the best alignment it found.
+pub fn analyse(a: &[Sig], b: &[Sig], top: usize, bottom: usize) -> (Shift, Option<Match>) {
     let h = a.len().min(b.len());
     let (lo, hi) = (top, h.saturating_sub(bottom));
-    if hi <= lo + 8 {
-        return Shift::Lost;
+    if hi <= lo + 16 {
+        return (Shift::Lost, None);
     }
     // Unchanged?
     let (same, info) = (lo..hi).fold((0, 0), |(m, t), r| {
-        if a[r].1 {
-            (m + (a[r].0 == b[r].0) as usize, t + 1)
+        if a[r].info {
+            (m + (dist(&a[r], &b[r]) <= SAME_TOL) as usize, t + 1)
         } else {
             (m, t)
         }
     });
     if info == 0 || same * 100 >= info * 98 {
-        return Shift::None;
+        return (Shift::None, None);
     }
-    let mut best: Option<(usize, usize, usize)> = None; // (shift, matches, total)
-    for s in 1..(hi - lo - 8) {
-        let (mut m, mut t) = (0usize, 0usize);
+    // Score every shift by its average (capped) row difference; capping keeps a changing
+    // region (an animated ad, a video) from swamping an otherwise perfect match.
+    let core = hi - lo;
+    let mut best: Option<(usize, usize, usize, u64)> = None; // (shift, matches, rows, cost)
+    for s in 1..core.saturating_sub(8) {
+        let (mut m, mut t, mut cost) = (0usize, 0usize, 0u64);
         for r in lo..hi - s {
-            if a[r + s].1 {
+            let (ra, rb) = (&a[r + s], &b[r]);
+            if ra.info || rb.info {
+                let d = dist(ra, rb);
                 t += 1;
-                if a[r + s].0 == b[r].0 {
-                    m += 1;
-                }
+                m += (d <= MATCH_TOL) as usize;
+                cost += d.min(40) as u64;
             }
         }
-        if t < 8 {
+        if t < 12 {
             continue;
         }
         let better = match best {
             None => true,
-            // higher match ratio wins; ties → more evidence
-            Some((_, bm, bt)) => m * bt > bm * t || (m * bt == bm * t && m > bm),
+            // lower average cost wins; ties → more evidence
+            Some((_, _, bt, bc)) => cost * (bt as u64) < bc * (t as u64) || (cost * bt as u64 == bc * t as u64 && t > bt),
         };
         if better {
-            best = Some((s, m, t));
+            best = Some((s, m, t, cost));
         }
     }
-    match best {
-        Some((s, m, t)) if m * 100 >= t * 85 => Shift::By(s),
-        _ => Shift::Lost,
+    let Some((s, m, t, _)) = best else { return (Shift::Lost, None) };
+    let info = Match { shift: s, percent: m * 100 / t, rows: t };
+    if m * 100 >= t * 70 {
+        (Shift::By(s), Some(info))
+    } else {
+        (Shift::Lost, Some(info))
     }
 }
 
@@ -200,7 +247,10 @@ pub fn run(target: ScrollTarget, stop: Arc<AtomicBool>, progress: Arc<AtomicU32>
     let restore = input::cursor_pos();
     let max_h = (MAX_BYTES / (w as u64 * 4).max(1)).min(60_000) as usize;
 
-    let first = grab()?;
+    // Put the pointer over the area first (hover effects, overlay fade-out), then take
+    // the first frame once the screen is still.
+    input::set_cursor(center);
+    let first = wait_until_still(&grab, &stop)?;
     let mut prev_sig = signatures(&first);
     let mut stitcher = Stitcher::new(first);
     progress.store(h, Ordering::Relaxed);
@@ -243,16 +293,29 @@ pub fn run(target: ScrollTarget, stop: Arc<AtomicBool>, progress: Arc<AtomicU32>
                     continue;
                 }
                 Some((f1, s1)) => {
-                    let Some(b) = fixed_bands(&s1, &sig).or_else(|| fixed_bands(&prev_sig, &s1)) else { break };
+                    let Some(mut b) = fixed_bands(&s1, &sig).or_else(|| fixed_bands(&prev_sig, &s1)) else { break };
+                    let mut res = analyse(&prev_sig, &s1, b.0, b.1);
+                    if !matches!(res.0, Shift::By(_)) {
+                        // Try the bands of the first pair instead.
+                        if let Some(b0) = fixed_bands(&prev_sig, &s1) {
+                            let r0 = analyse(&prev_sig, &s1, b0.0, b0.1);
+                            if matches!(r0.0, Shift::By(_)) {
+                                (b, res) = (b0, r0);
+                            }
+                        }
+                    }
                     bands = Some(b);
-                    match find_shift(&prev_sig, &s1, b.0, b.1) {
+                    match res.0 {
                         Shift::By(s) => {
-                            crate::diag::log(&format!("scroll step 1: By({s}), fixed bands top={} bottom={}", b.0, b.1));
+                            crate::diag::log(&format!("scroll step 1: By({s}), fixed bands top={} bottom={}, {:?}", b.0, b.1, res.1));
                             stitcher.push(f1, s, b);
                             prev_sig = s1;
                         }
                         other => {
-                            crate::diag::log(&format!("scroll step 1: {other:?} — couldn't line up the first scroll"));
+                            crate::diag::log(&format!(
+                                "scroll step 1: {other:?} — couldn't line up the first scroll; bands top={} bottom={}, best {:?}",
+                                b.0, b.1, res.1
+                            ));
                             notes.push("Stopped: couldn't line up the first scroll".into());
                             break;
                         }
@@ -261,8 +324,20 @@ pub fn run(target: ScrollTarget, stop: Arc<AtomicBool>, progress: Arc<AtomicU32>
                 }
             },
         };
-        let shift = find_shift(&prev_sig, &sig, b.0, b.1);
-        crate::diag::log(&format!("scroll step {step}: {shift:?}, fixed bands top={} bottom={}, {notches} notches", b.0, b.1));
+        let (mut shift, mut best) = analyse(&prev_sig, &sig, b.0, b.1);
+        let (mut frame, mut sig) = (frame, sig);
+        if shift == Shift::Lost {
+            // Something may still have been settling (lazy-loaded images, animations): look again.
+            crate::diag::log(&format!("scroll step {step}: Lost (best {best:?}), retrying"));
+            std::thread::sleep(Duration::from_millis(500));
+            frame = wait_until_still(&grab, &stop)?;
+            sig = signatures(&frame);
+            (shift, best) = analyse(&prev_sig, &sig, b.0, b.1);
+        }
+        crate::diag::log(&format!(
+            "scroll step {step}: {shift:?}, fixed bands top={} bottom={}, {notches} notches, best {best:?}",
+            b.0, b.1
+        ));
         match shift {
             Shift::By(s) => {
                 still = 0;
@@ -426,6 +501,37 @@ mod tests {
         assert_eq!(find_shift(&a, &a, 0, 0), Shift::None);
     }
 
+    /// Re-rendering noise: every pixel nudged by a small pseudo-random amount, different
+    /// per frame (what browsers do with anti-aliasing / colour management).
+    fn noisy(img: &RgbaImage, seed: u32) -> RgbaImage {
+        let mut out = img.clone();
+        for (i, px) in out.pixels_mut().enumerate() {
+            let n = ((i as u32).wrapping_mul(2_654_435_761).wrapping_add(seed.wrapping_mul(40_503)) >> 27) as i32 - 16; // -16..15
+            let d = n / 3; // about ±5
+            for c in 0..3 {
+                px.0[c] = (px.0[c] as i32 + d).clamp(0, 255) as u8;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn tolerates_rendering_noise_and_a_changing_region() {
+        let p = page(400, 3000);
+        let a = view(&p, 0, 600, 0, 0);
+        let mut b = noisy(&view(&p, 211, 600, 0, 0), 7);
+        // an "animated ad": a block in the middle that differs completely
+        for y in 250..330 {
+            for x in 0..400 {
+                b.put_pixel(x, y, Rgba([(x * 3 % 256) as u8, 0, (y % 256) as u8, 255]));
+            }
+        }
+        let (shift, m) = analyse(&signatures(&a), &signatures(&b), 0, 0);
+        assert_eq!(shift, Shift::By(211), "{m:?}");
+        // and noise alone doesn't count as movement
+        assert_eq!(find_shift(&signatures(&a), &signatures(&noisy(&a, 3)), 0, 0), Shift::None);
+    }
+
     #[test]
     fn stitches_a_page_exactly() {
         let p = page(160, 2000);
@@ -474,5 +580,30 @@ mod tests {
         for y in [header, 200, 500, 700, out.height() - footer - 1] {
             assert_eq!(out.get_pixel(17, y), p.get_pixel(17, y), "row {y}");
         }
+    }
+
+    /// Real browser frames: `SNIPPY_SCROLL_FRAMES=dir` with f0.png, f1.png, … taken while
+    /// scrolling. Run with `cargo test real_frames -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn real_frames() {
+        let dir = std::env::var("SNIPPY_SCROLL_FRAMES").expect("SNIPPY_SCROLL_FRAMES");
+        let frames: Vec<RgbaImage> = (0..)
+            .map_while(|i| image::open(format!("{dir}/f{i}.png")).ok().map(|im| im.to_rgba8()))
+            .collect();
+        assert!(frames.len() >= 3);
+        let sigs: Vec<_> = frames.iter().map(signatures).collect();
+        let b = fixed_bands(&sigs[1], &sigs[2]).unwrap();
+        println!("bands {b:?}");
+        let mut st = Stitcher::new(frames[0].clone());
+        for i in 1..frames.len() {
+            let (shift, m) = analyse(&sigs[i - 1], &sigs[i], b.0, b.1);
+            println!("frame {i}: {shift:?} {m:?}");
+            let Shift::By(s) = shift else { panic!("frame {i}: {shift:?}") };
+            st.push(frames[i].clone(), s, b);
+        }
+        let out = st.finish();
+        out.save(format!("{dir}/stitched.png")).unwrap();
+        println!("stitched {}x{}", out.width(), out.height());
     }
 }

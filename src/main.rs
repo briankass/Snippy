@@ -765,6 +765,9 @@ impl SnippyApp {
     fn handle_flyout(&mut self, ctx: &egui::Context) {
         let Some(f) = self.flyout.as_mut() else { return };
         let Some(action) = f.show(ctx, &self.settings.look, self.glass, self.style_gen) else { return };
+        if action != FlyoutAction::Close {
+            diag::log(&format!("app: flyout {action:?}"));
+        }
         match action {
             FlyoutAction::Close => {
                 diag::log("app: flyout closed");
@@ -1085,6 +1088,11 @@ impl eframe::App for SnippyApp {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, eframe::APP_KEY, &self.settings);
+    }
+
+    fn on_exit(&mut self) {
+        diag::log("--- Snippy exited normally");
+        std::thread::sleep(std::time::Duration::from_millis(50)); // let the log writer flush
     }
 
     /// Runs even while the window is hidden, so capture results are handled here

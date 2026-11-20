@@ -1,6 +1,6 @@
 [package]
 name = "snippy"
-version = "0.9.1"
+version = "0.9.2"
 edition = "2021"
 description = "A tiny floating screen snipping and recording tool"
 
@@ -43,6 +43,8 @@ windows = { version = "0.62", features = [
     "Win32_UI_Input",
     "Win32_System_SystemInformation",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
     # Windows OCR (copy text from screen)
     "Foundation",
     "Foundation_Collections",

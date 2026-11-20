@@ -56,21 +56,95 @@ pub fn install_panic_hook() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let thread = std::thread::current();
-        let line = format!(
-            "{}  CRASH (thread '{}'): {info}\n",
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
-            thread.name().unwrap_or("?")
-        );
-        let p = path();
-        if let Some(dir) = p.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
-            let _ = f.write_all(line.as_bytes());
-            let _ = f.flush();
-        }
+        write_now(&format!("CRASH (thread '{}'): {info}", thread.name().unwrap_or("?")));
         default(info);
     }));
+    #[cfg(windows)]
+    native::install();
+}
+
+/// Appends a line to the log immediately (for crashes, when the writer thread may never run).
+fn write_now(msg: &str) {
+    let line = format!("{}  {msg}\n", chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"));
+    let p = path();
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+        let _ = f.write_all(line.as_bytes());
+        let _ = f.flush();
+    }
+}
+
+/// Native crashes (access violations in drivers or system DLLs, stack overflows) bypass
+/// Rust's panic hook; record the exception code and the module it happened in.
+#[cfg(windows)]
+mod native {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HMODULE;
+    use windows::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, SetUnhandledExceptionFilter, EXCEPTION_POINTERS};
+    use windows::Win32::System::LibraryLoader::{
+        GetModuleFileNameW, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+    };
+
+    const STACK_OVERFLOW: u32 = 0xC000_00FD;
+
+    unsafe fn describe(info: *const EXCEPTION_POINTERS) -> String {
+        let Some(rec) = info.as_ref().and_then(|i| i.ExceptionRecord.as_ref()) else { return "unknown exception".into() };
+        let code = rec.ExceptionCode.0 as u32;
+        let addr = rec.ExceptionAddress as usize;
+        let mut module = HMODULE::default();
+        let mut name = String::from("?");
+        if GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            PCWSTR(addr as *const u16),
+            &mut module,
+        )
+        .is_ok()
+        {
+            let mut buf = [0u16; 260];
+            let n = GetModuleFileNameW(Some(module), &mut buf) as usize;
+            name = String::from_utf16_lossy(&buf[..n]);
+            name = name.rsplit('\\').next().unwrap_or(&name).to_string();
+        }
+        let what = match code {
+            0xC000_0005 => " (access violation)",
+            STACK_OVERFLOW => " (stack overflow)",
+            0xC000_0409 => " (fail-fast)",
+            0xC000_001D => " (illegal instruction)",
+            0x8000_0003 => " (breakpoint)",
+            _ => "",
+        };
+        let thread = std::thread::current();
+        format!(
+            "CRASH (native, thread '{}'): exception 0x{code:08X}{what} in {name}+0x{:X}",
+            thread.name().unwrap_or("?"),
+            addr.wrapping_sub(module.0 as usize)
+        )
+    }
+
+    unsafe extern "system" fn unhandled(info: *const EXCEPTION_POINTERS) -> i32 {
+        super::write_now(&describe(info));
+        0 // EXCEPTION_CONTINUE_SEARCH: let Windows end the process as usual
+    }
+
+    /// Stack overflows never reach the unhandled-exception filter (Rust's own handler
+    /// aborts first), so catch those here.
+    unsafe extern "system" fn vectored(info: *mut EXCEPTION_POINTERS) -> i32 {
+        if let Some(rec) = info.as_ref().and_then(|i| i.ExceptionRecord.as_ref()) {
+            if rec.ExceptionCode.0 as u32 == STACK_OVERFLOW {
+                super::write_now(&describe(info));
+            }
+        }
+        0 // EXCEPTION_CONTINUE_SEARCH
+    }
+
+    pub fn install() {
+        unsafe {
+            SetUnhandledExceptionFilter(Some(unhandled));
+            AddVectoredExceptionHandler(1, Some(vectored));
+        }
+    }
 }
 
 /// Windows Snipping Tool detection (to catch presses that slip past Snippy).
