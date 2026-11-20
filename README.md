@@ -59,7 +59,7 @@ The floating bar, top to bottom:
 | Speaker / Mic | *(video mode)* record system audio / microphone |
 | Timer | Delay (snips) or countdown (recordings): 0 → 3 → 5 → 10 s. Right-click resets |
 | Gear | Settings |
-| ✕ | Exit |
+| Tray arrow | Hide to the system tray (click the tray icon to bring it back). Right-click exits |
 
 In the selection overlay, **Esc** or **right-click** cancels.
 

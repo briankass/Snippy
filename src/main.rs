@@ -130,6 +130,8 @@ struct Settings {
     hotkey_print_screen: bool,
     hotkey_win_shift_s: bool,
     shortcut_action: ShortcutAction,
+    /// The "Snippy is in the tray" tip has been shown once.
+    tray_hint_shown: bool,
 }
 
 impl Default for Settings {
@@ -156,6 +158,7 @@ impl Default for Settings {
             hotkey_print_screen: true,
             hotkey_win_shift_s: true,
             shortcut_action: ShortcutAction::ShowBar,
+            tray_hint_shown: false,
         }
     }
 }
@@ -267,6 +270,33 @@ impl SnippyApp {
             if matches!(self.phase, Phase::Bar) {
                 self.show_bar(ctx);
             }
+        }
+    }
+
+    /// The bar's "hide to tray" button: hides the bar until the tray icon is clicked (or a
+    /// shortcut brings it up). Turns the tray icon on if needed, so Snippy stays reachable.
+    pub(crate) fn hide_to_tray(&mut self, ctx: &egui::Context) {
+        if !self.settings.tray_icon {
+            self.settings.tray_icon = true;
+            self.sync_tray(ctx);
+        }
+        if self.tray.is_none() {
+            // No tray on this system: hiding would make Snippy unreachable, so exit instead.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        self.tip = None;
+        self.bar_revealed = false;
+        self.settings.hide_bar = true;
+        self.show_bar(ctx);
+        if !self.settings.tray_hint_shown {
+            self.settings.tray_hint_shown = true;
+            let anchor = self.flyout_anchor(ctx);
+            self.flyout = Some(Flyout::message(
+                "Snippy is in the system tray",
+                "Click its icon to bring the bar back (look under the ^ arrow).",
+                anchor,
+            ));
         }
     }
 
@@ -610,8 +640,9 @@ impl SnippyApp {
         self.show_home(ctx);
     }
 
-    /// The work area (screen minus taskbar) of the monitor Snippy is on, in global points.
-    fn flyout_anchor(&self, ctx: &egui::Context) -> Rect {
+    /// Where flyouts go: the work area (screen minus taskbar) of the monitor of the last
+    /// capture (or of the bar), in physical pixels, with that monitor's scale.
+    fn flyout_anchor(&self, ctx: &egui::Context) -> flyout::Anchor {
         let (outer, ppp, monitor) = ctx.input(|i| {
             (
                 i.viewport().outer_rect,
@@ -621,8 +652,15 @@ impl SnippyApp {
         });
         let probe = self.last_probe.unwrap_or_else(|| outer.map_or(Pos2::ZERO, |r| r.center()) * ppp);
         match platform::work_area(probe.x as i32, probe.y as i32) {
-            Some([l, t, r, b]) => Rect::from_min_max(Pos2::new(l as f32, t as f32) / ppp, Pos2::new(r as f32, b as f32) / ppp),
-            None => Rect::from_min_size(Pos2::ZERO, monitor - Vec2::new(0.0, 48.0)),
+            Some([l, t, r, b]) => {
+                let scale = Monitor::from_point(probe.x as i32, probe.y as i32)
+                    .ok()
+                    .and_then(|m| m.scale_factor().ok())
+                    .unwrap_or(ppp);
+                flyout::Anchor { work: Rect::from_min_max(Pos2::new(l as f32, t as f32), Pos2::new(r as f32, b as f32)), scale }
+            }
+            // No OS work-area info: assume the monitor at the origin, minus a taskbar.
+            None => flyout::Anchor { work: Rect::from_min_size(Pos2::ZERO, (monitor - Vec2::new(0.0, 48.0)) * ppp), scale: ppp },
         }
     }
 

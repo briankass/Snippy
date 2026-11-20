@@ -26,7 +26,7 @@ enum Item {
     Mic,
     Timer,
     Settings,
-    Close,
+    HideToTray,
     // recording bar
     Status,
     Pause,
@@ -50,7 +50,7 @@ fn bar_items(s: &Settings) -> Vec<Item> {
     if s.record_mode {
         v.extend([Item::Speaker, Item::Mic]);
     }
-    v.extend([Item::Timer, Item::Sep, Item::Settings, Item::Close]);
+    v.extend([Item::Timer, Item::Sep, Item::Settings, Item::HideToTray]);
     v
 }
 
@@ -205,11 +205,11 @@ impl SnippyApp {
                         None,
                     ),
                     Item::Settings => (Icon::Gear, "Settings".into(), self.settings_open.then_some(Color32::from_white_alpha(30))),
-                    Item::Close => (Icon::Close, "Exit Snippy".into(), None),
+                    Item::HideToTray => (Icon::HideToTray, "Hide to system tray (right-click to exit)".into(), None),
                     Item::Status | Item::Pause | Item::Stop => continue,
                 };
 
-                let enabled = !capturing || matches!(item, Item::Close | Item::Settings);
+                let enabled = !capturing || matches!(item, Item::HideToTray | Item::Settings);
                 let resp = icon_button(ui, id, r, icon, fill, enabled, clear);
                 if item == Item::Timer && self.settings.delay_secs > 0 {
                     // little badge with the seconds
@@ -243,12 +243,15 @@ impl SnippyApp {
                             }
                         }
                         Item::Settings => self.settings_open = !self.settings_open,
-                        Item::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                        Item::HideToTray => self.hide_to_tray(&ctx),
                         _ => {}
                     }
                 }
                 if item == Item::Timer && resp.secondary_clicked() {
                     self.settings.delay_secs = 0;
+                }
+                if item == Item::HideToTray && resp.secondary_clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
         });
@@ -368,6 +371,17 @@ impl SnippyApp {
         let screen_w = ctx.input(|i| i.viewport().monitor_size.map_or(f32::MAX, |m| m.x));
         let x = if outer.max.x + 8.0 + size.x > screen_w { outer.min.x - 8.0 - size.x } else { outer.max.x + 8.0 };
         let pos = Pos2::new(x, outer.min.y + local_y - size.y / 2.0);
+        // Exact placement in physical pixels beside the bar (logical coordinates don't map
+        // consistently across monitors with different scaling).
+        let placed: Option<platform::PxRect> = self.main_hwnd.and_then(platform::window_rect).map(|[l, t, r, b]| {
+            let ppp = ctx.input(|i| i.viewport().native_pixels_per_point.unwrap_or(1.0));
+            let (w, h) = ((size.x * ppp).round() as i32, (size.y * ppp).round() as i32);
+            let gap = (8.0 * ppp) as i32;
+            let right_edge = platform::work_area((l + r) / 2, (t + b) / 2).map_or(i32::MAX, |a| a[2]);
+            let x = if r + gap + w > right_edge { l - gap - w } else { r + gap };
+            let y = t + (local_y * ppp) as i32 - h / 2;
+            [x, y, x + w, y + h]
+        });
 
         let builder = egui::ViewportBuilder::default()
             .with_title(TOOLTIP_TITLE)
@@ -386,6 +400,9 @@ impl SnippyApp {
             paint_glass_panel_min(ui.painter(), r, &look, glass, 6.0, 0.6);
             ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, &text, font.clone(), Color32::WHITE);
         });
+        if let Some(r) = placed {
+            platform::place_window(TOOLTIP_TITLE, r);
+        }
         let gen = self.style_gen;
         let backdrop = self.settings.look.backdrop;
         if let Some((_, _, styled)) = &mut self.tip {

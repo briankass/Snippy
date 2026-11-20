@@ -13,6 +13,16 @@ const H: f32 = 136.0;
 const NOTE_H: f32 = 16.0;
 const TITLE: &str = "Snippy notification";
 
+/// Where flyouts go: a monitor's work area (screen minus taskbar) in physical pixels, and
+/// that monitor's display scale. Placing in physical pixels keeps the flyout in the right
+/// corner even when monitors use different scaling (logical coordinates don't map
+/// consistently across mixed-DPI monitors).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Anchor {
+    pub(crate) work: Rect,
+    pub(crate) scale: f32,
+}
+
 pub(crate) enum FlyoutKind {
     Snip { image: RgbaImage, path: Option<PathBuf> },
     Recording(RecordingInfo),
@@ -40,8 +50,7 @@ pub(crate) struct Flyout {
     pub(crate) notes: Vec<String>,
     thumb: Option<egui::TextureHandle>,
     thumb_size: Vec2,
-    /// Usable screen area (global points) to anchor to.
-    anchor: Rect,
+    anchor: Anchor,
     lifetime: f64,
     deadline: Option<f64>,
     styled_gen: Option<u64>,
@@ -52,7 +61,7 @@ fn folder_label(path: &Path) -> String {
 }
 
 impl Flyout {
-    fn new(kind: FlyoutKind, title: String, subtitle: String, notes: Vec<String>, thumb: Option<(&egui::Context, &RgbaImage)>, anchor: Rect) -> Self {
+    fn new(kind: FlyoutKind, title: String, subtitle: String, notes: Vec<String>, thumb: Option<(&egui::Context, &RgbaImage)>, anchor: Anchor) -> Self {
         let (thumb, thumb_size) = match thumb {
             Some((ctx, img)) => {
                 let t = record::make_thumbnail(img, 360);
@@ -65,7 +74,7 @@ impl Flyout {
         Self { kind, title, subtitle, notes, thumb, thumb_size, anchor, lifetime, deadline: None, styled_gen: None }
     }
 
-    pub(crate) fn snip(ctx: &egui::Context, image: RgbaImage, path: Option<PathBuf>, copied: Result<(), String>, save_err: Option<String>, anchor: Rect) -> Self {
+    pub(crate) fn snip(ctx: &egui::Context, image: RgbaImage, path: Option<PathBuf>, copied: Result<(), String>, save_err: Option<String>, anchor: Anchor) -> Self {
         let mut notes = Vec::new();
         let title = match &copied {
             Ok(()) => "Copied to clipboard".to_string(),
@@ -81,7 +90,7 @@ impl Flyout {
         f
     }
 
-    pub(crate) fn recording(ctx: &egui::Context, info: RecordingInfo, anchor: Rect) -> Self {
+    pub(crate) fn recording(ctx: &egui::Context, info: RecordingInfo, anchor: Anchor) -> Self {
         let secs = info.duration.as_secs();
         let size = if info.bytes >= 1_048_576 {
             format!("{:.1} MB", info.bytes as f64 / 1_048_576.0)
@@ -100,7 +109,7 @@ impl Flyout {
         f
     }
 
-    pub(crate) fn update(rel: updater::Release, anchor: Rect) -> Self {
+    pub(crate) fn update(rel: updater::Release, anchor: Anchor) -> Self {
         let title = format!("Snippy {} is available", updater::version_string(rel.version));
         let subtitle = format!("You have {}. Updating takes a few seconds.", updater::version_string(updater::current_version()));
         let mut f = Self::new(FlyoutKind::Message, title, subtitle, Vec::new(), None, anchor);
@@ -109,7 +118,7 @@ impl Flyout {
         f
     }
 
-    pub(crate) fn message(title: impl Into<String>, detail: impl Into<String>, anchor: Rect) -> Self {
+    pub(crate) fn message(title: impl Into<String>, detail: impl Into<String>, anchor: Anchor) -> Self {
         Self::new(FlyoutKind::Message, title.into(), detail.into(), Vec::new(), None, anchor)
     }
 
@@ -152,7 +161,11 @@ impl Flyout {
         ctx.request_repaint_after(Duration::from_millis(250));
 
         let size = Vec2::new(W, H + NOTE_H * self.notes.len().min(3) as f32);
-        let pos = self.anchor.max - size - Vec2::new(14.0, 14.0);
+        // Bottom-right of the work area, in physical pixels.
+        let sc = self.anchor.scale;
+        let max = self.anchor.work.max - Vec2::splat(14.0 * sc);
+        let rect_px = Rect::from_min_max(max - size * sc, max);
+        let pos = rect_px.min / sc; // initial guess in points; corrected below
         let builder = egui::ViewportBuilder::default()
             .with_title(TITLE)
             .with_position(pos)
@@ -262,6 +275,7 @@ impl Flyout {
             }
         });
 
+        platform::place_window(TITLE, [rect_px.min.x, rect_px.min.y, rect_px.max.x, rect_px.max.y].map(|v| v.round() as i32));
         if hovered {
             self.deadline = Some(now + 4.0f64.max(deadline - now));
         }

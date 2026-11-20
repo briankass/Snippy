@@ -35,6 +35,7 @@ pub enum Icon {
     Pointer,
     Tray,
     Keyboard,
+    HideToTray,
 }
 
 /// Draws `icon` centred in `rect` (scaled to fit), in `color`.
@@ -194,6 +195,12 @@ pub fn draw(p: &Painter, icon: Icon, rect: Rect, color: Color32) {
             for x in [6.0, 12.0, 18.0] {
                 p.circle_filled(pt(x, 14.6), 1.2 * s, color);
             }
+        }
+        Icon::HideToTray => {
+            // arrow dropping into a tray
+            line(&[(12.0, 3.5), (12.0, 13.5)]);
+            line(&[(7.5, 9.5), (12.0, 14.0), (16.5, 9.5)]);
+            line(&[(4.0, 14.5), (4.0, 19.5), (20.0, 19.5), (20.0, 14.5)]);
         }
         Icon::Keyboard => {
             rrect(2.5, 6.0, 21.5, 18.0, 2.5);
