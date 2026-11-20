@@ -36,6 +36,8 @@ pub enum Hotkey {
 
 static PRINT_SCREEN: AtomicBool = AtomicBool::new(false);
 static WIN_SHIFT_S: AtomicBool = AtomicBool::new(false);
+/// Close a Windows Snipping Tool that pops up right after a shortcut Snippy handled.
+static CLOSE_SNIPPING_TOOL: AtomicBool = AtomicBool::new(true);
 /// Filled by the hook callback (never blocks: bounded + `try_send`).
 static QUEUE: OnceLock<SyncSender<Hotkey>> = OnceLock::new();
 
@@ -49,9 +51,10 @@ fn new_press(swallowing: &AtomicBool, last_down: &std::sync::atomic::AtomicU32, 
 }
 
 /// Enables/disables each shortcut (cheap; the hook stays installed).
-pub fn configure(print_screen: bool, win_shift_s: bool) {
+pub fn configure(print_screen: bool, win_shift_s: bool, close_snipping_tool: bool) {
     PRINT_SCREEN.store(print_screen, Ordering::Relaxed);
     WIN_SHIFT_S.store(win_shift_s, Ordering::Relaxed);
+    CLOSE_SNIPPING_TOOL.store(close_snipping_tool, Ordering::Relaxed);
 }
 
 /// Called from the hook callback: must return immediately. Returns whether it was queued.
@@ -375,6 +378,55 @@ mod imp {
         if v.is_empty() { "none".into() } else { v.join("+") }
     }
 
+    /// Watches for ~2.5 s whether the Windows Snipping Tool appears after a press. If it
+    /// does and Snippy already handled the press, closes it (if enabled) — but only a
+    /// process that started *after* the press (so an open Snipping Tool with unsaved work
+    /// is never killed), or, for an already-running one, just cancels its capture overlay
+    /// with Esc when that overlay is in front.
+    fn watch_for_snipping_tool(key: &'static str, handled: bool) {
+        use crate::diag::snipping_tool as st;
+        let before = st::processes();
+        let before_pids: Vec<u32> = before.iter().map(|(p, _)| *p).collect();
+        let before_windows = st::visible_windows_of(&before_pids);
+        std::thread::spawn(move || {
+            let close = handled && CLOSE_SNIPPING_TOOL.load(Ordering::Relaxed);
+            for step in 1..=17u64 {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                let ms = step * 150;
+                let now = st::processes();
+                let fresh: Vec<&(u32, String)> = now.iter().filter(|(p, _)| !before_pids.contains(p)).collect();
+                if !fresh.is_empty() {
+                    for (pid, name) in fresh {
+                        let outcome = if close {
+                            if st::terminate(*pid) { "closed it" } else { "couldn't close it" }
+                        } else if handled {
+                            "left it (auto-close is off)"
+                        } else {
+                            "left it (key went to Windows)"
+                        };
+                        crate::diag::log(&format!("snipping tool: {name} STARTED ~{ms} ms after {key} -> {outcome}"));
+                    }
+                    return;
+                }
+                let pids: Vec<u32> = now.iter().map(|(p, _)| *p).collect();
+                let windows = st::visible_windows_of(&pids);
+                if windows.iter().any(|w| !before_windows.contains(w)) {
+                    let fg = st::foreground_pid();
+                    let outcome = if close && pids.contains(&fg) {
+                        st::send_escape();
+                        "cancelled its capture overlay (Esc)"
+                    } else if close {
+                        "left it (not in front)"
+                    } else {
+                        "left it"
+                    };
+                    crate::diag::log(&format!("snipping tool: already-running instance SHOWED A WINDOW ~{ms} ms after {key} -> {outcome}"));
+                    return;
+                }
+            }
+        });
+    }
+
     /// Starts the thread that logs key records and checks whether the Windows Snipping
     /// Tool shows up after one of our shortcuts.
     pub fn start_diagnostics() {
@@ -387,7 +439,7 @@ mod imp {
             .spawn(move || {
                 let mut last_check = std::time::Instant::now() - std::time::Duration::from_secs(10);
                 for r in rx {
-                    let key = if r.prtsc { "Print Screen" } else { "S (Win held)" };
+                    let key = if r.prtsc { "Print Screen" } else { "S" };
                     let line = match r.source {
                         Source::Hook => format!(
                             "key: hook  {key} {}  mods={}{}{}  -> {}{}",
@@ -409,28 +461,13 @@ mod imp {
                         Source::Raw => format!("key: raw   {key} down  mods={}", mods_text(r.mods)),
                     };
                     crate::diag::log(&line);
-                    // On a press: is the Snipping Tool running, and does it pop up?
-                    if r.down && r.source == Source::Raw && last_check.elapsed().as_millis() > 1500 {
+                    // After a shortcut press: does the Windows Snipping Tool pop up anyway?
+                    // (It can, through paths a keyboard hook can't block: another hook
+                    // that runs before ours, or keyboard software launching it directly.)
+                    if r.down && r.source == Source::Hook && last_check.elapsed().as_millis() > 1500 {
                         last_check = std::time::Instant::now();
-                        let before_pids = crate::diag::snipping_tool::pids().len();
-                        let before = crate::diag::snipping_tool::visible_windows();
-                        crate::diag::log(&format!(
-                            "snipping tool: {} process(es) running, {} visible window(s) at the press",
-                            before_pids, before
-                        ));
-                        std::thread::spawn(move || {
-                            // (elapsed ms, wait before this check)
-                            for (ms, wait) in [(250u64, 250u64), (750, 500), (2000, 1250)] {
-                                std::thread::sleep(std::time::Duration::from_millis(wait));
-                                let now = crate::diag::snipping_tool::visible_windows();
-                                if now > before {
-                                    crate::diag::log(&format!(
-                                        "snipping tool: WINDOW APPEARED ~{ms} ms after {key} ({before} -> {now} visible)"
-                                    ));
-                                    return;
-                                }
-                            }
-                        });
+                        let handled = r.swallowed;
+                        watch_for_snipping_tool(key, handled);
                     }
                 }
             })

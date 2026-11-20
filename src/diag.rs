@@ -58,13 +58,17 @@ pub mod snipping_tool {
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, IsWindowVisible};
+    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_ESCAPE,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetForegroundWindow, GetWindowThreadProcessId, IsWindowVisible};
 
     /// Process names of the Windows Snipping Tool and its screen-capture overlay.
     const NAMES: [&str; 2] = ["snippingtool.exe", "screenclippinghost.exe"];
 
-    /// PIDs of running Snipping Tool processes.
-    pub fn pids() -> Vec<u32> {
+    /// Running Snipping Tool processes: (pid, exe name).
+    pub fn processes() -> Vec<(u32, String)> {
         let mut out = Vec::new();
         unsafe {
             let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return out };
@@ -74,7 +78,7 @@ pub mod snipping_tool {
                 let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
                 let name = String::from_utf16_lossy(&e.szExeFile[..len]).to_ascii_lowercase();
                 if NAMES.contains(&name.as_str()) {
-                    out.push(e.th32ProcessID);
+                    out.push((e.th32ProcessID, name));
                 }
                 ok = Process32NextW(snap, &mut e).is_ok();
             }
@@ -83,26 +87,52 @@ pub mod snipping_tool {
         out
     }
 
-    unsafe extern "system" fn count_visible(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let st = &mut *(lparam.0 as *mut (Vec<u32>, usize));
+    unsafe extern "system" fn collect_visible(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let st = &mut *(lparam.0 as *mut (Vec<u32>, Vec<isize>));
         let mut pid = 0u32;
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
         if st.0.contains(&pid) && IsWindowVisible(hwnd).as_bool() {
-            st.1 += 1;
+            st.1.push(hwnd.0 as isize);
         }
         BOOL(1)
     }
 
-    /// Number of visible top-level windows belonging to the Snipping Tool.
-    pub fn visible_windows() -> usize {
-        let pids = pids();
+    /// Visible top-level windows of the given processes.
+    pub fn visible_windows_of(pids: &[u32]) -> Vec<isize> {
         if pids.is_empty() {
-            return 0;
+            return Vec::new();
         }
-        let mut st: (Vec<u32>, usize) = (pids, 0);
+        let mut st: (Vec<u32>, Vec<isize>) = (pids.to_vec(), Vec::new());
         unsafe {
-            let _ = EnumWindows(Some(count_visible), LPARAM(&mut st as *mut _ as isize));
+            let _ = EnumWindows(Some(collect_visible), LPARAM(&mut st as *mut _ as isize));
         }
         st.1
+    }
+
+    /// Process owning the foreground window.
+    pub fn foreground_pid() -> u32 {
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut pid)) };
+        pid
+    }
+
+    pub fn terminate(pid: u32) -> bool {
+        unsafe {
+            let Ok(h) = OpenProcess(PROCESS_TERMINATE, false, pid) else { return false };
+            let ok = TerminateProcess(h, 0).is_ok();
+            let _ = CloseHandle(h);
+            ok
+        }
+    }
+
+    /// Presses Esc (cancels the Snipping Tool's capture overlay when it's in front).
+    pub fn send_escape() {
+        let key = |flags: KEYBD_EVENT_FLAGS| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VK_ESCAPE, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
+        };
+        unsafe {
+            SendInput(&[key(KEYBD_EVENT_FLAGS(0)), key(KEYEVENTF_KEYUP)], std::mem::size_of::<INPUT>() as i32);
+        }
     }
 }

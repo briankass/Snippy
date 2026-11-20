@@ -133,6 +133,8 @@ struct Settings {
     shortcut_action: ShortcutAction,
     /// The "Snippy is in the tray" tip has been shown once.
     tray_hint_shown: bool,
+    /// Close a Windows Snipping Tool that pops up right after a shortcut Snippy handled.
+    close_snipping_tool: bool,
 }
 
 impl Default for Settings {
@@ -160,6 +162,7 @@ impl Default for Settings {
             hotkey_win_shift_s: true,
             shortcut_action: ShortcutAction::ShowBar,
             tray_hint_shown: false,
+            close_snipping_tool: true,
         }
     }
 }
@@ -221,7 +224,7 @@ impl SnippyApp {
         platform::refresh_startup_path();
         let (events_tx, events_rx) = mpsc::channel();
         hotkeys::install(&cc.egui_ctx, events_tx.clone());
-        hotkeys::configure(settings.hotkey_print_screen, settings.hotkey_win_shift_s);
+        hotkeys::configure(settings.hotkey_print_screen, settings.hotkey_win_shift_s, settings.close_snipping_tool);
         let mut app = Self {
             phase: Phase::Bar,
             settings,
@@ -250,12 +253,13 @@ impl SnippyApp {
         };
         app.sync_tray(&cc.egui_ctx);
         diag::log(&format!(
-            "--- Snippy {} started. shortcuts: PrintScreen={} Win+Shift+S={} action={:?}; tray={} bar_hidden={}; \
+            "--- Snippy {} started. shortcuts: PrintScreen={} Win+Shift+S={} action={:?} close_snipping_tool={}; tray={} bar_hidden={}; \
              Windows PrintScreen->SnippingTool={}; glass={:?}",
             env!("CARGO_PKG_VERSION"),
             app.settings.hotkey_print_screen,
             app.settings.hotkey_win_shift_s,
             app.settings.shortcut_action,
+            app.settings.close_snipping_tool,
             app.tray.is_some(),
             app.bar_hidden(),
             platform::prtsc_opens_snipping_tool(),

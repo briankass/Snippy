@@ -208,6 +208,12 @@ impl SnippyApp {
                     }
                 });
             }
+            if cfg!(windows) {
+                row(ui, Icon::Close, "Close the Windows Snipping Tool if it still pops up",
+                    "Some keyboards and Windows itself can open it anyway. Only a Snipping Tool that starts right after a shortcut Snippy handled is closed, never one you already had open", |ui| {
+                    changed |= toggle(ui, &mut self.settings.close_snipping_tool).changed();
+                });
+            }
             row(ui, Icon::Region, "When a shortcut is pressed", "Show the bar to pick what to capture, or start snipping right away", |ui| {
                 ui.selectable_value(&mut self.settings.shortcut_action, ShortcutAction::Snip, "Start a snip");
                 ui.selectable_value(&mut self.settings.shortcut_action, ShortcutAction::ShowBar, "Show the bar");
@@ -224,7 +230,7 @@ impl SnippyApp {
                 }
             });
             if changed {
-                hotkeys::configure(self.settings.hotkey_print_screen, self.settings.hotkey_win_shift_s);
+                hotkeys::configure(self.settings.hotkey_print_screen, self.settings.hotkey_win_shift_s, self.settings.close_snipping_tool);
             }
             ui.add(egui::Label::new(RichText::new(
                 "\"Show the bar\" brings the bar to the front (also in tray-only mode, until your next capture). \
