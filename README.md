@@ -13,12 +13,14 @@ executable: no installer, no runtime dependencies.
 
 **Screenshots**
 - Region (drag), Window (click to pick) or Full screen, with an optional 3 / 5 / 10 s delay
+- Works across **all monitors**: the selection overlay covers every screen (with several
+  monitors, Full screen asks which one); mixed display scaling is handled
 - Copied to the clipboard and auto-saved to `Pictures\Screenshots`
 - A flyout in the corner offers **Edit · Copy · Save as · Open folder**
 - Editor: pen, highlighter, arrow and box; undo / redo; save as PNG or JPEG
 
 **Screen recording**
-- Record a region, a window or the full screen to **MP4 (H.264 + AAC)**
+- Record a region, a window or a full screen, on any monitor, to **MP4 (H.264 + AAC)**
 - **System audio** and/or **microphone**, mixed and kept in sync with the video
 - Countdown, pause / resume, red outline around the recorded area, mouse pointer in the video
 - Saved to `Videos\Snippy`; the flyout offers **Play · Save as · Delete · Open folder**
@@ -35,6 +37,7 @@ executable: no installer, no runtime dependencies.
 - **Print Screen** and **Windows + Shift + S** bring up the Snippy bar (or, if you prefer, start a
   snip right away) instead of the Windows Snipping
   Tool (each can be turned off in Settings)
+- The bar jumps to the monitor under your mouse when a shortcut brings it up
 - System tray icon with quick snip / record actions; optional tray-only mode that hides the bar
 
 **Settings** (gear icon on the bar)

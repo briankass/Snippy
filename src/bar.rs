@@ -405,22 +405,27 @@ fn on_off(b: bool) -> &'static str {
 /// Outlines the recorded area with four thin, solid, always-on-top strips placed just
 /// *outside* it. They never overlap the area, so they can't end up in the video, and they
 /// don't rely on window transparency (which isn't available everywhere).
-pub(crate) fn show_recording_border(ctx: &egui::Context, area: Rect, paused: bool) {
-    const GAP: f32 = 1.0;
-    const T: f32 = 3.0;
-    let o = area.expand(GAP);
-    let strips = [
-        Rect::from_min_max(Pos2::new(o.min.x - T, o.min.y - T), Pos2::new(o.max.x + T, o.min.y)), // top
-        Rect::from_min_max(Pos2::new(o.min.x - T, o.max.y), Pos2::new(o.max.x + T, o.max.y + T)), // bottom
-        Rect::from_min_max(Pos2::new(o.min.x - T, o.min.y), Pos2::new(o.min.x, o.max.y)),         // left
-        Rect::from_min_max(Pos2::new(o.max.x, o.min.y), Pos2::new(o.max.x + T, o.max.y)),         // right
+/// `area` is in virtual-desktop physical pixels; strips are placed in physical pixels too,
+/// so they line up on any monitor whatever its display scaling.
+pub(crate) fn show_recording_border(ctx: &egui::Context, area: platform::PxRect, paused: bool) {
+    let [l, t, r, b] = area;
+    let (gap, th) = (1, 3);
+    let (l, t, r, b) = (l - gap, t - gap, r + gap, b + gap);
+    let strips: [platform::PxRect; 4] = [
+        [l - th, t - th, r + th, t], // top
+        [l - th, b, r + th, b + th], // bottom
+        [l - th, t, l, b],           // left
+        [r, t, r + th, b],           // right
     ];
+    let ppp = ctx.input(|i| i.viewport().native_pixels_per_point.unwrap_or(1.0));
     let color = if paused { Color32::from_rgb(240, 180, 40) } else { REC_RED };
-    for (i, r) in strips.into_iter().enumerate() {
+    for (i, s) in strips.into_iter().enumerate() {
+        let title = format!("Snippy recording area {i}");
+        // Approximate placement in points; corrected in physical pixels below.
         let builder = egui::ViewportBuilder::default()
-            .with_title("Snippy recording area")
-            .with_position(r.min)
-            .with_inner_size(r.size())
+            .with_title(&title)
+            .with_position(Pos2::new(s[0] as f32, s[1] as f32) / ppp)
+            .with_inner_size(Vec2::new((s[2] - s[0]) as f32, (s[3] - s[1]) as f32) / ppp)
             .with_min_inner_size(Vec2::splat(1.0))
             .with_decorations(false)
             .with_always_on_top()
@@ -432,6 +437,7 @@ pub(crate) fn show_recording_border(ctx: &egui::Context, area: Rect, paused: boo
             let rect = ui.max_rect();
             ui.painter().rect_filled(rect, 0.0, color);
         });
+        platform::place_window(&title, s);
     }
 }
 

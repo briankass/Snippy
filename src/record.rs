@@ -35,8 +35,8 @@ const MAX_QUEUED_FRAMES: usize = 3;
 #[derive(Clone, Debug)]
 pub struct RecordTarget {
     pub monitor_id: Option<u32>,
-    /// `None` = the whole monitor.
-    pub region: Option<[u32; 4]>,
+    /// `[x, y, width, height]` in virtual-desktop physical pixels; `None` = the whole monitor.
+    pub region: Option<[i32; 4]>,
 }
 
 #[derive(Clone, Debug)]
@@ -229,7 +229,11 @@ fn run(target: RecordTarget, opts: RecordOptions, path: &Path, sh: Arc<Shared>) 
     let cursor_scale = monitor.scale_factor().unwrap_or(1.0).max(1.0);
     let (mw, mh) = (monitor.width().map_err(|e| e.to_string())?, monitor.height().map_err(|e| e.to_string())?);
     // H.264 4:2:0 needs even dimensions.
-    let [rx, ry, rw, rh] = clamp_region(target.region.unwrap_or([0, 0, mw, mh]), mw, mh)?;
+    // Desktop coordinates → this monitor's pixels.
+    let local = target.region.map_or([0, 0, mw, mh], |[x, y, w, h]| {
+        [(x - mon_x).max(0) as u32, (y - mon_y).max(0) as u32, w.max(0) as u32, h.max(0) as u32]
+    });
+    let [rx, ry, rw, rh] = clamp_region(local, mw, mh)?;
 
     let (tx, rx_msgs) = mpsc::channel::<Msg>();
     let mut notes = Vec::new();

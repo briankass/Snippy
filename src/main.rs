@@ -165,7 +165,8 @@ enum Phase {
     Capturing,
     Overlay(Overlay),
     Editor,
-    Recording { recorder: Recorder, border: Option<Rect> },
+    /// `border`: recorded area in virtual-desktop physical pixels (None = whole monitor).
+    Recording { recorder: Recorder, border: Option<platform::PxRect> },
 }
 
 struct SnippyApp {
@@ -267,11 +268,44 @@ impl SnippyApp {
         self.settings.hide_bar && self.tray.is_some() && !self.bar_revealed
     }
 
+    /// If the bar is on a different monitor than the mouse pointer, moves it next to the
+    /// pointer (clamped to that monitor's work area). Positions are physical pixels, so this
+    /// works across monitors with different display scaling.
+    fn bring_bar_to_pointer(&self) {
+        let (Some(h), Some((cx, cy))) = (self.main_hwnd, record::cursor_position()) else { return };
+        let Some(target) = platform::work_area(cx, cy) else { return };
+        let bar = platform::window_rect(h);
+        let bar_area = bar.and_then(|[l, t, r, b]| platform::work_area((l + r) / 2, (t + b) / 2));
+        if bar_area == Some(target) && !self.bar_hidden_before_reveal() {
+            return; // already on this monitor
+        }
+        let scale = Monitor::from_point(cx, cy).ok().and_then(|m| m.scale_factor().ok()).unwrap_or(1.0);
+        let size = bar::bar_size(&self.settings) * scale;
+        let (w, hgt) = (size.x.round() as i32, size.y.round() as i32);
+        let gap = (24.0 * scale) as i32;
+        let [l, t, r, b] = target;
+        let margin = (8.0 * scale) as i32;
+        let mut x = cx + gap;
+        if x + w > r - margin {
+            x = cx - gap - w; // not enough room on the right: put it on the left of the pointer
+        }
+        let y = cy - hgt / 2;
+        let x = x.clamp(l + margin, (r - margin - w).max(l + margin));
+        let y = y.clamp(t + margin, (b - margin - hgt).max(t + margin));
+        platform::move_window(h, x, y);
+    }
+
+    /// In tray-only mode the bar was hidden until this reveal; always bring it to the pointer then.
+    fn bar_hidden_before_reveal(&self) -> bool {
+        self.settings.hide_bar && self.tray.is_some()
+    }
+
     /// Shows the bar (even in tray-only mode) and brings it to the front.
     fn reveal_bar(&mut self, ctx: &egui::Context) {
         match self.phase {
             Phase::Bar => {
                 self.bar_revealed = true;
+                self.bring_bar_to_pointer();
                 self.show_bar(ctx);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
@@ -343,43 +377,72 @@ impl SnippyApp {
 impl SnippyApp {
     fn show_bar(&mut self, ctx: &egui::Context) {
         self.phase = Phase::Bar;
+        if self.bar_hidden() {
+            ghost_main(ctx);
+            return;
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+        ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(bar::bar_size(&self.settings)));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(!self.bar_hidden()));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
     }
 
     /// Back to the editor if one is open, otherwise to the bar.
     fn show_home(&mut self, ctx: &egui::Context) {
-        if self.editor.is_some() {
+        if let Some(ed) = &self.editor {
             self.phase = Phase::Editor;
+            let (ppp, monitor) = ctx.input(|i| {
+                (
+                    i.viewport().native_pixels_per_point.unwrap_or(1.0),
+                    i.viewport().monitor_size.unwrap_or(Vec2::new(1920.0, 1080.0)),
+                )
+            });
+            let size = editor_size(Vec2::new(ed.image.width() as f32, ed.image.height() as f32), ppp, monitor);
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         } else {
             self.show_bar(ctx);
         }
     }
 
+    /// Shows the selection overlay on every monitor (one window each). The main window
+    /// becomes an invisible "ghost" that hosts them.
     fn show_overlay(&mut self, ctx: &egui::Context, cap: Capture) {
-        let texture = image_to_texture(ctx, "overlay", &cap.image);
-        self.phase = Phase::Overlay(Overlay {
-            purpose: cap.purpose,
-            mode: cap.mode,
-            monitor_id: cap.monitor_id,
-            image: cap.image,
-            texture,
-            windows: cap.windows,
-            drag: None,
-        });
-        // Still hidden here, so the user never sees the bar stretched to full screen.
-        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
-        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        self.phase = Phase::Overlay(Overlay::new(ctx, cap));
+        ghost_main(ctx);
+        ctx.request_repaint();
+    }
+
+    /// Acts on a choice made in the overlay.
+    fn overlay_selected(&mut self, ctx: &egui::Context, screen: usize, px: Rect) {
+        let Phase::Overlay(ov) = &mut self.phase else { return };
+        let s = &ov.screens[screen].screen;
+        self.last_probe = Some(s.bounds().center());
+        let full = Rect::from_min_size(Pos2::ZERO, Vec2::new(s.image.width() as f32, s.image.height() as f32));
+        match ov.purpose {
+            Purpose::Snip => match crop_px(&s.image, px) {
+                Some(img) => self.finish_snip(ctx, img),
+                None => ov.drag = None,
+            },
+            Purpose::Record => {
+                let monitor_id = s.monitor_id;
+                let whole = px.min.distance(full.min) < 1.0 && px.max.distance(full.max) < 1.0;
+                let (region, border) = if whole {
+                    (None, None)
+                } else {
+                    let o = s.origin;
+                    let b = [o.x + px.min.x, o.y + px.min.y, o.x + px.max.x, o.y + px.max.y].map(|v| v.round() as i32);
+                    (Some([b[0], b[1], b[2] - b[0], b[3] - b[1]]), Some(b))
+                };
+                self.begin_recording(ctx, RecordTarget { monitor_id, region }, border);
+            }
+        }
     }
 
     fn show_editor(&mut self, ctx: &egui::Context, img: RgbaImage) {
@@ -390,8 +453,7 @@ impl SnippyApp {
                 i.viewport().monitor_size.unwrap_or(Vec2::new(1920.0, 1080.0)),
             )
         });
-        let want = Vec2::new(img.width() as f32, img.height() as f32) / ppp + Vec2::new(32.0, 110.0);
-        let size = want.max(Vec2::new(760.0, 420.0)).min(monitor * 0.85);
+        let size = editor_size(Vec2::new(img.width() as f32, img.height() as f32), ppp, monitor);
         self.status = format!("{} × {} — Ctrl+C copies, Ctrl+S saves", img.width(), img.height());
 
         let texture = image_to_texture(ctx, "editor", &img);
@@ -408,6 +470,7 @@ impl SnippyApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+        ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -442,7 +505,9 @@ impl SnippyApp {
         let (tx, rx) = mpsc::channel();
         self.capture_rx = Some(rx);
         self.phase = Phase::Capturing;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        // Shrink to an invisible ghost (never truly hide: see `ghost_main`). On Windows the
+        // window is excluded from capture anyway; elsewhere it's a single transparent pixel.
+        ghost_main(&ctx);
 
         std::thread::spawn(move || {
             // Let the OS finish hiding us (and any fade animation), plus the user's delay.
@@ -593,7 +658,7 @@ impl SnippyApp {
 
 impl SnippyApp {
     /// `border`: the recorded area in global points, to outline it on screen (None = full screen).
-    fn begin_recording(&mut self, ctx: &egui::Context, target: RecordTarget, border: Option<Rect>) {
+    fn begin_recording(&mut self, ctx: &egui::Context, target: RecordTarget, border: Option<platform::PxRect>) {
         let opts = record::RecordOptions {
             fps: self.settings.fps.clamp(5, 60),
             countdown: Duration::from_secs(self.settings.delay_secs),
@@ -611,6 +676,7 @@ impl SnippyApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+        ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(bar::rec_bar_size()));
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
     }
@@ -642,12 +708,6 @@ impl eframe::App for SnippyApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_updates(ctx);
         self.handle_events(ctx);
-        // In tray-only mode the main window is hidden, but flyouts and the settings window
-        // are drawn from its frame: keep it painting while they're up.
-        if matches!(self.phase, Phase::Bar) && self.bar_hidden() && (self.flyout.is_some() || self.settings_open) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
         let Some(rx) = &self.capture_rx else { return };
         let result = match rx.try_recv() {
             Ok(r) => r,
@@ -656,10 +716,14 @@ impl eframe::App for SnippyApp {
         };
         self.capture_rx = None;
         match result {
-            Ok(cap) if cap.mode == CaptureMode::FullScreen && cap.purpose == Purpose::Snip => self.finish_snip(ctx, cap.image),
-            Ok(cap) if cap.mode == CaptureMode::FullScreen => {
-                let target = RecordTarget { monitor_id: cap.monitor_id, region: None };
-                self.begin_recording(ctx, target, None);
+            // Full screen with a single monitor: no need to ask which one.
+            Ok(mut cap) if cap.mode == CaptureMode::FullScreen && cap.screens.len() == 1 => {
+                let s = cap.screens.remove(0);
+                self.last_probe = Some(s.bounds().center());
+                match cap.purpose {
+                    Purpose::Snip => self.finish_snip(ctx, s.image),
+                    Purpose::Record => self.begin_recording(ctx, RecordTarget { monitor_id: s.monitor_id, region: None }, None),
+                }
             }
             Ok(cap) => self.show_overlay(ctx, cap),
             Err(e) => {
@@ -672,22 +736,15 @@ impl eframe::App for SnippyApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let ghost = self.bar_hidden();
         match &mut self.phase {
-            Phase::Overlay(overlay) => match overlay_ui(ui, overlay) {
-                Some(OverlayOutcome::Selected { px, global }) => match overlay.purpose {
-                    Purpose::Snip => match crop_px(&overlay.image, px) {
-                        Some(img) => self.finish_snip(&ctx, img),
-                        None => overlay.drag = None,
-                    },
-                    Purpose::Record => {
-                        let r = [px.min.x, px.min.y, px.width(), px.height()].map(|v| v.round().max(0.0) as u32);
-                        let target = RecordTarget { monitor_id: overlay.monitor_id, region: Some(r) };
-                        self.begin_recording(&ctx, target, Some(global));
-                    }
-                },
+            Phase::Overlay(overlay) => match overlay.show(&ctx) {
+                Some(OverlayOutcome::Selected { screen, px }) => self.overlay_selected(&ctx, screen, px),
                 Some(OverlayOutcome::Cancel) => self.show_home(&ctx),
                 None => {}
             },
+            // Tray-only mode: the main window is a ghost; draw nothing in it.
+            Phase::Bar if ghost => {}
             Phase::Bar | Phase::Capturing => self.bar_ui(ui),
             Phase::Editor => self.editor_ui(ui),
             Phase::Recording { .. } => self.recording_ui(ui),
@@ -724,7 +781,7 @@ fn main() -> eframe::Result<()> {
             // The window was created at the default size; fit it to the saved settings.
             cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(bar::bar_size(&app.settings)));
             if app.bar_hidden() {
-                cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                ghost_main(&cc.egui_ctx);
             }
             Ok(Box::new(app))
         }),
@@ -736,4 +793,22 @@ fn app_icon() -> egui::IconData {
         Some((rgba, width, height)) => egui::IconData { rgba, width, height },
         None => egui::IconData::default(),
     }
+}
+
+/// Makes the main window invisible to the user *without* hiding it from Windows: 1×1 px,
+/// transparent (nothing is painted) and click-through.
+///
+/// Why not just hide it: eframe draws secondary windows (flyout, settings, overlays) from
+/// the main window's frame, and while the main window is hidden it can't *create* new ones.
+fn ghost_main(ctx: &egui::Context) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+    ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
+    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::splat(1.0)));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+}
+
+/// Editor window size for an image of `img` pixels: native size where it fits.
+fn editor_size(img: Vec2, ppp: f32, monitor: Vec2) -> Vec2 {
+    (img / ppp + Vec2::new(32.0, 110.0)).max(Vec2::new(760.0, 420.0)).min(monitor * 0.85)
 }

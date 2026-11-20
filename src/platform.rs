@@ -75,7 +75,11 @@ mod imp {
     };
     use windows::Win32::UI::Controls::MARGINS;
     use windows::Win32::UI::Shell::{FOLDERID_Pictures, FOLDERID_Videos, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
-    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE};
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, GetWindowRect, SetWindowDisplayAffinity, SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+        WDA_EXCLUDEFROMCAPTURE,
+    };
 
     fn hwnd(h: Hwnd) -> HWND {
         HWND(h as *mut _)
@@ -157,6 +161,34 @@ mod imp {
                 }
             }
         }
+    }
+
+    /// Puts the window titled `title` exactly at `rect` (physical pixels). Checked every
+    /// call, which also corrects the resize Windows applies when a window lands on a monitor
+    /// with different display scaling.
+    pub fn place_window(title: &str, [l, t, r, b]: PxRect) -> bool {
+        let Some(h) = find_window(title) else { return false };
+        let h = hwnd(h);
+        unsafe {
+            let mut cur = RECT::default();
+            if GetWindowRect(h, &mut cur).is_ok() && [cur.left, cur.top, cur.right, cur.bottom] == [l, t, r, b] {
+                return true;
+            }
+            SetWindowPos(h, None, l, t, r - l, b - t, SWP_NOZORDER | SWP_NOACTIVATE).is_ok()
+        }
+    }
+
+    /// Moves a window's top-left corner to `(x, y)` (physical pixels), keeping its size.
+    pub fn move_window(h: Hwnd, x: i32, y: i32) {
+        unsafe {
+            let _ = SetWindowPos(hwnd(h), None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+
+    /// The window's rectangle (physical pixels).
+    pub fn window_rect(h: Hwnd) -> Option<PxRect> {
+        let mut r = RECT::default();
+        unsafe { GetWindowRect(hwnd(h), &mut r) }.ok().map(|()| [r.left, r.top, r.right, r.bottom])
     }
 
     /// The usable area (excluding the taskbar) of the monitor containing a physical point.
@@ -246,6 +278,13 @@ mod imp {
     pub fn work_area(_x: i32, _y: i32) -> Option<PxRect> {
         None
     }
+    pub fn place_window(_title: &str, _rect: PxRect) -> bool {
+        false
+    }
+    pub fn move_window(_h: Hwnd, _x: i32, _y: i32) {}
+    pub fn window_rect(_h: Hwnd) -> Option<PxRect> {
+        None
+    }
     pub fn known_folder(f: Folder) -> Option<PathBuf> {
         let home = PathBuf::from(std::env::var_os("HOME")?);
         Some(home.join(match f {
@@ -262,7 +301,10 @@ mod imp {
     pub fn refresh_startup_path() {}
 }
 
-pub use imp::{find_window, known_folder, refresh_startup_path, set_startup, startup_enabled, style_window, work_area};
+pub use imp::{
+    find_window, known_folder, move_window, place_window, refresh_startup_path, set_startup, startup_enabled, style_window,
+    window_rect, work_area,
+};
 
 /// The native handle of eframe's main window.
 pub fn main_hwnd(cc: &eframe::CreationContext<'_>) -> Option<Hwnd> {
