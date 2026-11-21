@@ -203,6 +203,80 @@ pub mod snipping_tool {
         st.1
     }
 
+    /// A visible top-level window of another program (for working out what pops up after
+    /// a shortcut). Titles are deliberately not recorded (they can be private).
+    #[derive(Clone, Debug)]
+    pub struct WinInfo {
+        pub hwnd: isize,
+        pub pid: u32,
+        pub class: String,
+        pub rect: [i32; 4],
+        pub topmost: bool,
+    }
+
+    unsafe extern "system" fn collect_all(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetWindowLongW, GetWindowRect, GWL_EXSTYLE, WS_EX_TOPMOST};
+        let out = &mut *(lparam.0 as *mut Vec<WinInfo>);
+        if !IsWindowVisible(hwnd).as_bool() {
+            return BOOL(1);
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == std::process::id() {
+            return BOOL(1);
+        }
+        let mut buf = [0u16; 128];
+        let n = GetClassNameW(hwnd, &mut buf) as usize;
+        let mut r = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut r);
+        let topmost = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0;
+        out.push(WinInfo { hwnd: hwnd.0 as isize, pid, class: String::from_utf16_lossy(&buf[..n]), rect: [r.left, r.top, r.right, r.bottom], topmost });
+        BOOL(1)
+    }
+
+    /// All visible top-level windows of other programs.
+    pub fn visible_windows() -> Vec<WinInfo> {
+        let mut v: Vec<WinInfo> = Vec::new();
+        unsafe {
+            let _ = EnumWindows(Some(collect_all), LPARAM(&mut v as *mut _ as isize));
+        }
+        v
+    }
+
+    /// Process id → executable name (lower case), for every running process.
+    pub fn process_names() -> std::collections::HashMap<u32, String> {
+        let mut out = std::collections::HashMap::new();
+        unsafe {
+            let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return out };
+            let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+            let mut ok = Process32FirstW(snap, &mut e).is_ok();
+            while ok {
+                let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+                out.insert(e.th32ProcessID, String::from_utf16_lossy(&e.szExeFile[..len]).to_ascii_lowercase());
+                ok = Process32NextW(snap, &mut e).is_ok();
+            }
+            let _ = CloseHandle(snap);
+        }
+        out
+    }
+
+    /// One line describing a window: program, window class, size and position, topmost.
+    pub fn describe(w: &WinInfo, names: &std::collections::HashMap<u32, String>) -> String {
+        let [l, t, r, b] = w.rect;
+        format!(
+            "{} (pid {}), class \"{}\", {}x{} at {},{}{}",
+            names.get(&w.pid).map_or("?", |s| s.as_str()),
+            w.pid,
+            w.class,
+            r - l,
+            b - t,
+            l,
+            t,
+            if w.topmost { ", topmost" } else { "" }
+        )
+    }
+
     pub fn terminate(pid: u32) -> bool {
         unsafe {
             let Ok(h) = OpenProcess(PROCESS_TERMINATE, false, pid) else { return false };

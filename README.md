@@ -17,6 +17,9 @@ executable: no installer, no runtime dependencies.
   monitors, Full screen asks which one); mixed display scaling is handled
 - Copied to the clipboard and auto-saved to `Pictures\Screenshots`
 - A flyout in the corner offers **Edit · Copy · Save as · Open folder**
+- Editor: **select** (click an annotation to select it, drag to move, Delete to remove,
+  double-click text to edit it) and **crop** (drag the part to keep, Enter applies; undo
+  brings the rest back)
 - Editor: pen, highlighter, arrow, box, **text** and numbered **steps**; undo / redo; save
   as PNG or JPEG. Text: click and type (Shift+Enter for a new line, Enter to finish).
   Steps: click to place 1, 2, 3…, or drag to add an arrow to what the step points at
@@ -97,7 +100,9 @@ In the selection overlay, **Esc** or **right-click** cancels.
 | Ctrl+Z / Ctrl+Y (or Ctrl+Shift+Z) | Undo / Redo |
 | Ctrl+C | Copy (with annotations) |
 | Ctrl+S | Save as… |
+| V / C | Select / Crop |
 | P / H / A / R / T / N / X | Pen / Highlighter / Arrow / Box / Text / Step / Redact |
+| Delete · Enter · Esc | Delete selection · apply crop · cancel |
 
 ## Building
 

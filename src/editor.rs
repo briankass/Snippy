@@ -1,5 +1,6 @@
 use super::*;
 use crate::redact::RedactStyle;
+use std::sync::Arc;
 
 // ───────────────────────────── Editor ─────────────────────────────
 //
@@ -17,10 +18,15 @@ pub(crate) enum Tool {
     Text,
     /// Numbered step marker (click), optionally with an arrow (drag).
     Step,
+    /// Select, move and delete annotations.
+    Select,
+    /// Crop the picture.
+    Crop,
 }
 
 impl Tool {
-    const ALL: [(Tool, &'static str, &'static str); 7] = [
+    const ALL: [(Tool, &'static str, &'static str); 9] = [
+        (Tool::Select, "↖ Select", "V"),
         (Tool::Pen, "✏ Pen", "P"),
         (Tool::Highlighter, "🖍 Highlight", "H"),
         (Tool::Arrow, "➡ Arrow", "A"),
@@ -28,6 +34,7 @@ impl Tool {
         (Tool::Text, "🔤 Text", "T"),
         (Tool::Step, "① Step", "N"),
         (Tool::Redact, "▦ Redact", "X"),
+        (Tool::Crop, "⛶ Crop", "C"),
     ];
 }
 
@@ -73,6 +80,56 @@ impl Annotation {
         Some(Annotation { tool: Tool::Arrow, points: vec![start, end], width: (self.width / 10.0).max(2.0), ..self.clone() })
     }
 
+    /// Bounding box (image pixels), including the stroke width.
+    pub(crate) fn bounds(&self) -> Rect {
+        match self.tool {
+            Tool::Text => {
+                let (w, h) = text::measure(&self.text, self.width);
+                Rect::from_min_size(self.points[0], Vec2::new(w, h))
+            }
+            Tool::Step => {
+                let r = self.width / 2.0;
+                let mut b = Rect::from_center_size(self.points[0], Vec2::splat(self.width));
+                if let Some(a) = self.step_arrow() {
+                    b = b.union(a.bounds());
+                }
+                b.expand(r * 0.1)
+            }
+            _ => {
+                let mut b = Rect::NOTHING;
+                for p in self.polylines().iter().flatten().chain(self.points.iter()) {
+                    b.extend_with(*p);
+                }
+                if self.tool == Tool::Redact {
+                    b
+                } else {
+                    b.expand(self.width / 2.0)
+                }
+            }
+        }
+    }
+
+    /// Whether `p` (image pixels) is on this annotation, within `tol` pixels.
+    pub(crate) fn hit(&self, p: Pos2, tol: f32) -> bool {
+        match self.tool {
+            Tool::Text | Tool::Redact => self.bounds().expand(tol).contains(p),
+            Tool::Step => {
+                p.distance(self.points[0]) <= self.width / 2.0 + tol
+                    || self.step_arrow().is_some_and(|a| a.hit(p, tol))
+            }
+            _ => self.polylines().iter().any(|line| match line.as_slice() {
+                [only] => p.distance(*only) <= self.width / 2.0 + tol,
+                pts => pts.windows(2).any(|s| dist_to_segment(p, s[0], s[1]) <= self.width / 2.0 + tol),
+            }),
+        }
+    }
+
+    pub(crate) fn translate(&mut self, d: Vec2) {
+        for p in &mut self.points {
+            *p += d;
+        }
+    }
+
     fn rect(&self) -> [f32; 4] {
         let (a, b) = (self.points[0], *self.points.last().unwrap());
         [a.x, a.y, b.x, b.y]
@@ -85,7 +142,7 @@ impl Annotation {
     pub(crate) fn polylines(&self) -> Vec<Vec<Pos2>> {
         match self.tool {
             Tool::Pen | Tool::Highlighter => vec![self.points.clone()],
-            Tool::Text => vec![],
+            Tool::Text | Tool::Select | Tool::Crop => vec![],
             Tool::Step => self.step_arrow().map(|a| a.polylines()).unwrap_or_default(),
             Tool::Rect | Tool::Redact => {
                 let (a, b) = (self.points[0], *self.points.last().unwrap());
@@ -108,16 +165,32 @@ impl Annotation {
     }
 }
 
+/// One undo step: the annotations and the picture (which a crop changes).
+#[derive(Clone)]
+pub(crate) struct Snapshot {
+    annotations: Vec<Annotation>,
+    image: Arc<RgbaImage>,
+}
+
 pub(crate) struct Editor {
-    pub(crate) image: RgbaImage,
+    pub(crate) image: Arc<RgbaImage>,
     pub(crate) texture: egui::TextureHandle,
+    /// Which picture `texture` shows (a crop replaces the picture).
+    pub(crate) texture_of: usize,
     pub(crate) annotations: Vec<Annotation>,
     pub(crate) active: Option<Annotation>,
-    pub(crate) undo: Vec<Vec<Annotation>>,
-    pub(crate) redo: Vec<Vec<Annotation>>,
+    pub(crate) undo: Vec<Snapshot>,
+    pub(crate) redo: Vec<Snapshot>,
+    /// Bumped on every change (keeps the rendered preview up to date).
+    pub(crate) rev: u64,
+    /// Select tool: the selected annotation, and whether it's being dragged.
+    pub(crate) selected: Option<usize>,
+    pub(crate) moving: bool,
+    /// Crop tool: the area to keep `[x0, y0, x1, y1]` (image pixels, any corner order).
+    pub(crate) crop: Option<[f32; 4]>,
     /// While there are redactions: the rendered result (redactions can't be drawn as
     /// shapes over the image), and the edit state it was rendered for.
-    pub(crate) preview: Option<(egui::TextureHandle, (usize, usize, usize))>,
+    pub(crate) preview: Option<(egui::TextureHandle, (u64, usize))>,
     /// Text being typed (not yet an annotation).
     pub(crate) typing: Option<Annotation>,
     /// "Find personal info" running in the background.
@@ -125,24 +198,113 @@ pub(crate) struct Editor {
 }
 
 impl Editor {
+    pub(crate) fn new(ctx: &egui::Context, image: RgbaImage) -> Self {
+        let image = Arc::new(image);
+        let texture = image_to_texture(ctx, "editor", &image);
+        Editor {
+            texture_of: Arc::as_ptr(&image) as usize,
+            image,
+            texture,
+            annotations: Vec::new(),
+            active: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            rev: 0,
+            selected: None,
+            moving: false,
+            crop: None,
+            preview: None,
+            typing: None,
+            find_rx: None,
+        }
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot { annotations: self.annotations.clone(), image: self.image.clone() }
+    }
+
+    fn restore(&mut self, s: Snapshot) {
+        self.annotations = s.annotations;
+        self.image = s.image;
+        self.selected = None;
+        self.moving = false;
+        self.rev += 1;
+    }
+
     pub(crate) fn checkpoint(&mut self) {
-        self.undo.push(self.annotations.clone());
+        self.undo.push(self.snapshot());
         self.redo.clear();
+        self.rev += 1;
     }
     pub(crate) fn undo(&mut self) {
         if let Some(prev) = self.undo.pop() {
-            self.redo.push(std::mem::replace(&mut self.annotations, prev));
+            self.redo.push(self.snapshot());
+            self.restore(prev);
         }
     }
     pub(crate) fn redo(&mut self) {
         if let Some(next) = self.redo.pop() {
-            self.undo.push(std::mem::replace(&mut self.annotations, next));
+            self.undo.push(self.snapshot());
+            self.restore(next);
         }
     }
     pub(crate) fn clear(&mut self) {
         if !self.annotations.is_empty() {
             self.checkpoint();
             self.annotations.clear();
+            self.selected = None;
+        }
+    }
+
+    /// The topmost annotation under `p` (image pixels).
+    pub(crate) fn hit(&self, p: Pos2, tol: f32) -> Option<usize> {
+        self.annotations.iter().rposition(|a| a.hit(p, tol))
+    }
+
+    /// Deletes the selected annotation.
+    pub(crate) fn delete_selected(&mut self) {
+        if let Some(i) = self.selected.take().filter(|&i| i < self.annotations.len()) {
+            self.checkpoint();
+            self.annotations.remove(i);
+        }
+    }
+
+    /// The crop area, normalised and clipped to the picture: `[x, y, w, h]` in whole
+    /// pixels, if it's at least 2×2.
+    pub(crate) fn crop_rect(&self) -> Option<[u32; 4]> {
+        let [a, b, c, d] = self.crop?;
+        let (w, h) = (self.image.width() as f32, self.image.height() as f32);
+        let x0 = a.min(c).round().clamp(0.0, w);
+        let x1 = a.max(c).round().clamp(0.0, w);
+        let y0 = b.min(d).round().clamp(0.0, h);
+        let y1 = b.max(d).round().clamp(0.0, h);
+        (x1 - x0 >= 2.0 && y1 - y0 >= 2.0).then_some([x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32])
+    }
+
+    /// Crops the picture to the crop area; annotations stay where they were on it.
+    /// Returns whether the picture changed.
+    pub(crate) fn apply_crop(&mut self) -> bool {
+        let Some([x, y, w, h]) = self.crop_rect() else { return false };
+        self.crop = None;
+        if (x, y, w, h) == (0, 0, self.image.width(), self.image.height()) {
+            return false;
+        }
+        self.checkpoint();
+        self.image = Arc::new(imageops::crop_imm(&*self.image, x, y, w, h).to_image());
+        let d = Vec2::new(-(x as f32), -(y as f32));
+        for a in &mut self.annotations {
+            a.translate(d);
+        }
+        self.selected = None;
+        true
+    }
+
+    /// Re-uploads the picture after a crop / undo of a crop.
+    fn refresh_texture(&mut self, ctx: &egui::Context) {
+        let ptr = Arc::as_ptr(&self.image) as usize;
+        if ptr != self.texture_of {
+            self.texture = image_to_texture(ctx, "editor", &self.image);
+            self.texture_of = ptr;
         }
     }
     pub(crate) fn final_image(&self) -> RgbaImage {
@@ -176,7 +338,7 @@ impl Editor {
             self.preview = None;
             return;
         }
-        let key = (self.annotations.len(), self.undo.len(), self.redo.len());
+        let key = (self.rev, self.annotations.len());
         if self.preview.as_ref().is_some_and(|(_, k)| *k == key) {
             return;
         }
@@ -188,11 +350,21 @@ impl Editor {
 impl SnippyApp {
     pub(crate) fn editor_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        // Switching away from the text tool finishes the text being typed.
-        if self.settings.tool != Tool::Text {
-            if let Some(ed) = self.editor.as_mut() {
+        // Switching tools finishes the text being typed, drops an unapplied crop area and
+        // the selection.
+        let tool_now = self.settings.tool;
+        if let Some(ed) = self.editor.as_mut() {
+            if tool_now != Tool::Text {
                 ed.commit_text();
             }
+            if tool_now != Tool::Crop {
+                ed.crop = None;
+            }
+            if tool_now != Tool::Select {
+                ed.selected = None;
+                ed.moving = false;
+            }
+            ed.refresh_texture(&ctx);
         }
         if self.editor.as_ref().is_some_and(|e| e.typing.is_some()) {
             self.typing_keys(&ctx);
@@ -211,7 +383,26 @@ impl SnippyApp {
                 for (tool, label, key) in Tool::ALL {
                     ui.selectable_value(&mut self.settings.tool, tool, label).on_hover_text(format!("Shortcut: {key}"));
                 }
-                if self.settings.tool == Tool::Redact {
+                if self.settings.tool == Tool::Select {
+                    let sel = self.editor.as_ref().and_then(|e| e.selected).is_some();
+                    if ui.add_enabled(sel, egui::Button::new("🗑 Delete")).on_hover_text("Delete the selected annotation (Delete key)").clicked() {
+                        if let Some(ed) = self.editor.as_mut() {
+                            ed.delete_selected();
+                        }
+                    }
+                } else if self.settings.tool == Tool::Crop {
+                    let ready = self.editor.as_ref().and_then(|e| e.crop_rect());
+                    if let Some([_, _, w, h]) = ready {
+                        if ui.button("✔ Apply crop").on_hover_text("Enter").clicked() && self.editor.as_mut().is_some_and(|ed| ed.apply_crop()) {
+                            self.status = format!("Cropped to {w} × {h} — Ctrl+Z undoes");
+                        }
+                        if ui.button("Cancel").on_hover_text("Esc").clicked() {
+                            if let Some(ed) = self.editor.as_mut() {
+                                ed.crop = None;
+                            }
+                        }
+                    }
+                } else if self.settings.tool == Tool::Redact {
                     for (style, label, tip) in RedactStyle::ALL {
                         ui.selectable_value(&mut self.settings.redact_style, style, label).on_hover_text(tip);
                     }
@@ -268,8 +459,20 @@ impl SnippyApp {
             ui.horizontal(|ui| {
                 ui.label(&self.status);
                 if let Some(ed) = &self.editor {
+                    let crop_hint = ed.crop_rect().map(|[_, _, w, h]| format!("Keep {w} × {h} · Enter crops · Esc cancels"));
+                    let hint = match self.settings.tool {
+                        Tool::Select => "Click to select · drag to move · Delete removes · double-click text to edit",
+                        Tool::Crop => crop_hint.as_deref().unwrap_or("Drag over the part to keep"),
+                        Tool::Text => "Click and type · Shift+Enter new line · Enter finishes",
+                        Tool::Step => "Click to number · drag for an arrow",
+                        _ => "",
+                    };
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.weak(format!("{} × {} px", ed.image.width(), ed.image.height()));
+                        if !hint.is_empty() {
+                            ui.separator();
+                            ui.weak(hint);
+                        }
                     });
                 }
             });
@@ -284,6 +487,7 @@ impl SnippyApp {
             self.settings.redact_style,
             self.settings.text_size,
         );
+        let mut edit_text = false;
         egui::CentralPanel::default().show(ui, |ui| {
             let Some(ed) = self.editor.as_mut() else { return };
             let (img_w, img_h) = (ed.image.width() as f32, ed.image.height() as f32);
@@ -294,7 +498,16 @@ impl SnippyApp {
             let scale = (avail.width() / img_w).min(avail.height() / img_h).min(1.0 / ppp);
             let rect = Rect::from_center_size(avail.center(), Vec2::new(img_w, img_h) * scale);
             let resp = ui.allocate_rect(rect, egui::Sense::click_and_drag());
-            let resp = resp.on_hover_cursor(egui::CursorIcon::Crosshair);
+            let tol = 6.0 / scale; // pick tolerance: 6 screen points
+            let px_of = |p: Pos2| ((p - rect.min) / scale).to_pos2();
+            let cursor = match tool {
+                Tool::Select if ed.moving => egui::CursorIcon::Grabbing,
+                Tool::Select if resp.hover_pos().is_some_and(|p| ed.hit(px_of(p), tol).is_some()) => egui::CursorIcon::Grab,
+                Tool::Select => egui::CursorIcon::Default,
+                Tool::Text => egui::CursorIcon::Text,
+                _ => egui::CursorIcon::Crosshair,
+            };
+            let resp = resp.on_hover_cursor(cursor);
 
             ui.painter().rect_stroke(rect.expand(1.0), 0.0, ui.visuals().widgets.noninteractive.bg_stroke, egui::StrokeKind::Outside);
             ed.refresh_preview(&ctx);
@@ -314,13 +527,60 @@ impl SnippyApp {
                     _ => (pen, size),
                 };
                 let points = match tool {
-                    Tool::Pen | Tool::Highlighter | Tool::Text => vec![p],
+                    Tool::Pen | Tool::Highlighter | Tool::Text | Tool::Select | Tool::Crop => vec![p],
                     Tool::Arrow | Tool::Rect | Tool::Redact | Tool::Step => vec![p, p],
                 };
                 Annotation { tool, points, color, width, style, text: String::new(), number: next_step }
             };
 
-            if tool == Tool::Text {
+            if tool == Tool::Select {
+                if resp.double_clicked() {
+                    // Double-click text: edit it again.
+                    if let Some(i) = resp.interact_pointer_pos().and_then(|p| ed.hit(px_of(p), tol)) {
+                        if ed.annotations[i].tool == Tool::Text {
+                            ed.checkpoint();
+                            ed.typing = Some(ed.annotations.remove(i));
+                            ed.selected = None;
+                            edit_text = true;
+                        }
+                    }
+                } else if resp.clicked() {
+                    ed.selected = resp.interact_pointer_pos().and_then(|p| ed.hit(px_of(p), tol));
+                }
+                if resp.drag_started() {
+                    let hit = ctx.input(|i| i.pointer.press_origin()).and_then(|p| ed.hit(px_of(p), tol));
+                    ed.selected = hit;
+                    ed.moving = hit.is_some();
+                    if ed.moving {
+                        ed.checkpoint(); // one undo step per move
+                    }
+                }
+                if resp.dragged() && ed.moving {
+                    if let Some(i) = ed.selected {
+                        let d = resp.drag_delta() / scale;
+                        if d != Vec2::ZERO {
+                            ed.annotations[i].translate(d);
+                            ed.rev += 1;
+                        }
+                    }
+                }
+                if resp.drag_stopped() {
+                    ed.moving = false;
+                }
+            } else if tool == Tool::Crop {
+                if resp.drag_started() {
+                    if let Some(p) = ctx.input(|i| i.pointer.press_origin()) {
+                        let p = to_px(p);
+                        ed.crop = Some([p.x, p.y, p.x, p.y]);
+                    }
+                }
+                if resp.dragged() {
+                    if let (Some(p), Some(c)) = (resp.interact_pointer_pos(), ed.crop.as_mut()) {
+                        let p = to_px(p);
+                        (c[2], c[3]) = (p.x, p.y);
+                    }
+                }
+            } else if tool == Tool::Text {
                 let at = if resp.clicked() {
                     resp.interact_pointer_pos()
                 } else if resp.drag_started() {
@@ -362,7 +622,7 @@ impl SnippyApp {
                             }
                         }
                         Tool::Arrow | Tool::Rect | Tool::Redact | Tool::Step => a.points[1] = p,
-                        Tool::Text => {}
+                        Tool::Text | Tool::Select | Tool::Crop => {}
                     }
                 }
             }
@@ -439,7 +699,40 @@ impl SnippyApp {
                     }
                 }
             }
+            // Selection: a dashed box with corner handles.
+            if let Some(a) = ed.selected.and_then(|i| ed.annotations.get(i)) {
+                let b = a.bounds();
+                let r = Rect::from_min_max(to_screen(b.min), to_screen(b.max)).expand(4.0);
+                let accent = ui.visuals().selection.stroke.color;
+                let c = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
+                for s in c.windows(2) {
+                    painter.add(egui::Shape::dashed_line(&[s[0], s[1]], egui::Stroke::new(1.5, accent), 5.0, 3.0));
+                }
+                for p in &c[..4] {
+                    painter.rect(Rect::from_center_size(*p, Vec2::splat(7.0)), 1.0, Color32::WHITE, egui::Stroke::new(1.0, accent), egui::StrokeKind::Middle);
+                }
+            }
+            // Crop: dim what will be cut away.
+            if let Some([a, b, c, d]) = ed.crop {
+                let keep = Rect::from_two_pos(to_screen(Pos2::new(a, b)), to_screen(Pos2::new(c, d))).intersect(rect);
+                let dim = Color32::from_black_alpha(150);
+                painter.rect_filled(Rect::from_min_max(rect.min, Pos2::new(rect.max.x, keep.min.y)), 0.0, dim);
+                painter.rect_filled(Rect::from_min_max(Pos2::new(rect.min.x, keep.max.y), rect.max), 0.0, dim);
+                painter.rect_filled(Rect::from_min_max(Pos2::new(rect.min.x, keep.min.y), Pos2::new(keep.min.x, keep.max.y)), 0.0, dim);
+                painter.rect_filled(Rect::from_min_max(Pos2::new(keep.max.x, keep.min.y), Pos2::new(rect.max.x, keep.max.y)), 0.0, dim);
+                painter.rect_stroke(keep, 0.0, egui::Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Outside);
+                // rule-of-thirds guides
+                for t in [1.0 / 3.0, 2.0 / 3.0] {
+                    let x = keep.min.x + keep.width() * t;
+                    let y = keep.min.y + keep.height() * t;
+                    painter.vline(x, keep.y_range(), egui::Stroke::new(0.5, Color32::from_white_alpha(90)));
+                    painter.hline(keep.x_range(), y, egui::Stroke::new(0.5, Color32::from_white_alpha(90)));
+                }
+            }
         });
+        if edit_text {
+            self.settings.tool = Tool::Text;
+        }
     }
 
     pub(crate) fn editor_shortcuts(&mut self, ctx: &egui::Context) {
@@ -468,6 +761,29 @@ impl SnippyApp {
                     }
                 }
             });
+        }
+
+        // Select / crop keys.
+        let (del, enter, esc) = ctx.input(|i| {
+            (
+                i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace),
+                i.key_pressed(Key::Enter),
+                i.key_pressed(Key::Escape),
+            )
+        });
+        let tool = self.settings.tool;
+        if let Some(ed) = self.editor.as_mut() {
+            match tool {
+                Tool::Select if del => ed.delete_selected(),
+                Tool::Select if esc => ed.selected = None,
+                Tool::Crop if enter => {
+                    if ed.apply_crop() {
+                        self.status = format!("Cropped to {} × {} — Ctrl+Z undoes", ed.image.width(), ed.image.height());
+                    }
+                }
+                Tool::Crop if esc => ed.crop = None,
+                _ => {}
+            }
         }
 
         if new {
@@ -699,5 +1015,74 @@ mod tests {
         let p = out.get_pixel(30, 20);
         // 50% black over white ≈ 127, NOT ~0 as with per-step blending
         assert!((120..=135).contains(&p[0]), "got {p:?}");
+    }
+
+    fn boxed(a: (f32, f32), b: (f32, f32)) -> Annotation {
+        Annotation {
+            tool: Tool::Rect,
+            points: vec![Pos2::new(a.0, a.1), Pos2::new(b.0, b.1)],
+            color: Color32::RED,
+            width: 4.0,
+            style: RedactStyle::Pixelate,
+            text: String::new(),
+            number: 0,
+        }
+    }
+
+    #[test]
+    fn crop_keeps_annotations_in_place_and_undoes() {
+        let ctx = egui::Context::default();
+        let mut ed = Editor::new(&ctx, solid(100, 80));
+        ed.checkpoint();
+        ed.annotations.push(boxed((50.0, 40.0), (60.0, 50.0)));
+        ed.crop = Some([90.0, 70.0, 20.0, 10.0]); // dragged bottom-right to top-left
+        assert_eq!(ed.crop_rect(), Some([20, 10, 70, 60]));
+        ed.apply_crop();
+        assert_eq!((ed.image.width(), ed.image.height()), (70, 60));
+        assert_eq!(ed.annotations[0].points[0], Pos2::new(30.0, 30.0));
+        ed.undo();
+        assert_eq!((ed.image.width(), ed.image.height()), (100, 80));
+        assert_eq!(ed.annotations[0].points[0], Pos2::new(50.0, 40.0));
+        ed.redo();
+        assert_eq!((ed.image.width(), ed.image.height()), (70, 60));
+    }
+
+    #[test]
+    fn crop_area_is_clipped_and_tiny_areas_ignored() {
+        let ctx = egui::Context::default();
+        let mut ed = Editor::new(&ctx, solid(100, 80));
+        ed.crop = Some([-50.0, -20.0, 40.0, 500.0]);
+        assert_eq!(ed.crop_rect(), Some([0, 0, 40, 80]));
+        ed.crop = Some([10.0, 10.0, 11.0, 30.0]);
+        assert_eq!(ed.crop_rect(), None);
+    }
+
+    #[test]
+    fn select_hits_topmost_and_moves_and_deletes() {
+        let ctx = egui::Context::default();
+        let mut ed = Editor::new(&ctx, solid(200, 200));
+        ed.annotations.push(boxed((10.0, 10.0), (100.0, 100.0)));
+        ed.annotations.push(boxed((50.0, 10.0), (150.0, 100.0)));
+        // on the outline of both (x = 100 is box 0's right edge, inside box 1): box 1's top edge
+        assert_eq!(ed.hit(Pos2::new(75.0, 10.0), 3.0), Some(1), "topmost wins");
+        assert_eq!(ed.hit(Pos2::new(10.0, 55.0), 3.0), Some(0));
+        assert_eq!(ed.hit(Pos2::new(30.0, 55.0), 3.0), None, "inside a box outline isn't a hit");
+        ed.selected = Some(0);
+        ed.annotations[0].translate(Vec2::new(5.0, 7.0));
+        assert_eq!(ed.annotations[0].points[0], Pos2::new(15.0, 17.0));
+        ed.delete_selected();
+        assert_eq!(ed.annotations.len(), 1);
+        ed.undo();
+        assert_eq!(ed.annotations.len(), 2);
+    }
+
+    #[test]
+    fn text_and_steps_are_hit_by_their_area() {
+        let t = Annotation { tool: Tool::Text, text: "Hello".into(), width: 30.0, ..boxed((20.0, 20.0), (20.0, 20.0)) };
+        assert!(t.hit(Pos2::new(40.0, 35.0), 2.0));
+        assert!(!t.hit(Pos2::new(300.0, 35.0), 2.0));
+        let s = Annotation { tool: Tool::Step, number: 1, width: 40.0, points: vec![Pos2::new(100.0, 100.0)], ..boxed((0.0, 0.0), (0.0, 0.0)) };
+        assert!(s.hit(Pos2::new(110.0, 110.0), 2.0));
+        assert!(!s.hit(Pos2::new(160.0, 100.0), 2.0));
     }
 }

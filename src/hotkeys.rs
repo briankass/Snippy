@@ -434,7 +434,7 @@ mod imp {
     /// A watcher is running until this tick (0 = none). New presses extend it instead of
     /// starting another one.
     static WATCH_UNTIL: AtomicU32 = AtomicU32::new(0);
-    const WATCH_MS: u32 = 2500;
+    const WATCH_MS: u32 = 4000;
 
     /// After a shortcut press, watches ~2.5 s for Windows' own capture UI and closes it
     /// (if enabled and Snippy handled the press):
@@ -461,10 +461,31 @@ mod imp {
                 "snipping check after {key}: running [{}], {initial_vis} visible window(s)",
                 initial.iter().map(|(p, n)| format!("{n}:{p}")).collect::<Vec<_>>().join(", ")
             ));
+            // Every window that shows up during the watch is logged (program and window
+            // class, no titles), to identify whatever Windows opens; plus, right away, the
+            // big always-on-top windows already on screen (an overlay may appear at the
+            // same instant as the press).
+            let mut names = st::process_names();
+            let mut seen: std::collections::HashSet<isize> = std::collections::HashSet::new();
+            for w in st::visible_windows() {
+                seen.insert(w.hwnd);
+                let (ww, wh) = (w.rect[2] - w.rect[0], w.rect[3] - w.rect[1]);
+                if w.topmost && ww >= 600 && wh >= 400 {
+                    crate::diag::log(&format!("snipping check: big topmost window already up: {}", st::describe(&w, &names)));
+                }
+            }
             let mut acted = false;
             loop {
                 let procs = st::processes();
                 let ms = start.elapsed().as_millis();
+                for w in st::visible_windows() {
+                    if seen.insert(w.hwnd) {
+                        if !names.contains_key(&w.pid) {
+                            names = st::process_names();
+                        }
+                        crate::diag::log(&format!("snipping check: new window ~{ms} ms after {key}: {}", st::describe(&w, &names)));
+                    }
+                }
                 // Windows' capture overlay host.
                 let host: Vec<u32> = procs.iter().filter(|(_, n)| n == "screenclippinghost.exe").map(|(p, _)| *p).collect();
                 if !host.is_empty() && !st::visible_windows_of(&host).is_empty() {

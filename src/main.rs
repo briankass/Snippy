@@ -644,18 +644,7 @@ impl SnippyApp {
         let size = editor_size(Vec2::new(img.width() as f32, img.height() as f32), ppp, monitor);
         self.status = format!("{} × {} — Ctrl+C copies, Ctrl+S saves", img.width(), img.height());
 
-        let texture = image_to_texture(ctx, "editor", &img);
-        self.editor = Some(Editor {
-            image: img,
-            texture,
-            annotations: Vec::new(),
-            active: None,
-            undo: Vec::new(),
-            redo: Vec::new(),
-            preview: None,
-            typing: None,
-            find_rx: None,
-        });
+        self.editor = Some(Editor::new(ctx, img));
         self.phase = Phase::Editor;
 
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
