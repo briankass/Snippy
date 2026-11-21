@@ -13,14 +13,20 @@ pub(crate) enum Tool {
     Rect,
     /// Hide an area (pixelate / blur / black box).
     Redact,
+    /// Typed text.
+    Text,
+    /// Numbered step marker (click), optionally with an arrow (drag).
+    Step,
 }
 
 impl Tool {
-    const ALL: [(Tool, &'static str, &'static str); 5] = [
+    const ALL: [(Tool, &'static str, &'static str); 7] = [
         (Tool::Pen, "✏ Pen", "P"),
         (Tool::Highlighter, "🖍 Highlight", "H"),
         (Tool::Arrow, "➡ Arrow", "A"),
         (Tool::Rect, "⬜ Box", "R"),
+        (Tool::Text, "🔤 Text", "T"),
+        (Tool::Step, "① Step", "N"),
         (Tool::Redact, "▦ Redact", "X"),
     ];
 }
@@ -35,12 +41,36 @@ pub(crate) struct Annotation {
     pub(crate) width: f32,
     /// Redact only: how the area is hidden.
     pub(crate) style: RedactStyle,
+    /// Text only: the text (lines separated by '\n'). `width` is the font size in px.
+    pub(crate) text: String,
+    /// Step only: the number. `width` is the circle's diameter in px.
+    pub(crate) number: u32,
 }
 
 impl Annotation {
     /// A redaction of the area `r` (image pixels).
     pub(crate) fn redaction(r: [f32; 4], style: RedactStyle) -> Self {
-        Annotation { tool: Tool::Redact, points: vec![Pos2::new(r[0], r[1]), Pos2::new(r[2], r[3])], color: Color32::BLACK, width: 1.0, style }
+        Annotation {
+            tool: Tool::Redact,
+            points: vec![Pos2::new(r[0], r[1]), Pos2::new(r[2], r[3])],
+            color: Color32::BLACK,
+            width: 1.0,
+            style,
+            text: String::new(),
+            number: 0,
+        }
+    }
+
+    /// Step with a drag: the arrow from the circle's edge to where the drag ended.
+    fn step_arrow(&self) -> Option<Annotation> {
+        let (c, end) = (self.points[0], *self.points.last()?);
+        let d = end - c;
+        let r = self.width / 2.0;
+        if self.points.len() < 2 || d.length() <= r * 1.5 {
+            return None;
+        }
+        let start = c + d.normalized() * r;
+        Some(Annotation { tool: Tool::Arrow, points: vec![start, end], width: (self.width / 10.0).max(2.0), ..self.clone() })
     }
 
     fn rect(&self) -> [f32; 4] {
@@ -55,6 +85,8 @@ impl Annotation {
     pub(crate) fn polylines(&self) -> Vec<Vec<Pos2>> {
         match self.tool {
             Tool::Pen | Tool::Highlighter => vec![self.points.clone()],
+            Tool::Text => vec![],
+            Tool::Step => self.step_arrow().map(|a| a.polylines()).unwrap_or_default(),
             Tool::Rect | Tool::Redact => {
                 let (a, b) = (self.points[0], *self.points.last().unwrap());
                 vec![vec![a, Pos2::new(b.x, a.y), b, Pos2::new(a.x, b.y), a]]
@@ -86,6 +118,8 @@ pub(crate) struct Editor {
     /// While there are redactions: the rendered result (redactions can't be drawn as
     /// shapes over the image), and the edit state it was rendered for.
     pub(crate) preview: Option<(egui::TextureHandle, (usize, usize, usize))>,
+    /// Text being typed (not yet an annotation).
+    pub(crate) typing: Option<Annotation>,
     /// "Find personal info" running in the background.
     pub(crate) find_rx: Option<std::sync::mpsc::Receiver<Result<Vec<[f32; 4]>, String>>>,
 }
@@ -115,13 +149,30 @@ impl Editor {
         render_annotations(&self.image, &self.annotations)
     }
 
-    fn has_redactions(&self) -> bool {
-        self.annotations.iter().any(|a| a.tool == Tool::Redact)
+    /// Annotations that can't be drawn as shapes over the image (redactions, text, steps):
+    /// the editor then shows the rendered result.
+    fn needs_render(&self) -> bool {
+        self.annotations.iter().any(|a| matches!(a.tool, Tool::Redact | Tool::Text | Tool::Step))
+    }
+
+    /// The number the next step marker gets.
+    fn next_step(&self) -> u32 {
+        self.annotations.iter().filter(|a| a.tool == Tool::Step).map(|a| a.number).max().unwrap_or(0) + 1
+    }
+
+    /// Finishes the text being typed (empty text is dropped).
+    pub(crate) fn commit_text(&mut self) {
+        if let Some(t) = self.typing.take() {
+            if !t.text.trim().is_empty() {
+                self.checkpoint();
+                self.annotations.push(t);
+            }
+        }
     }
 
     /// Keeps the rendered preview in step with the annotations.
     fn refresh_preview(&mut self, ctx: &egui::Context) {
-        if !self.has_redactions() {
+        if !self.needs_render() {
             self.preview = None;
             return;
         }
@@ -137,7 +188,17 @@ impl Editor {
 impl SnippyApp {
     pub(crate) fn editor_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        self.editor_shortcuts(&ctx);
+        // Switching away from the text tool finishes the text being typed.
+        if self.settings.tool != Tool::Text {
+            if let Some(ed) = self.editor.as_mut() {
+                ed.commit_text();
+            }
+        }
+        if self.editor.as_ref().is_some_and(|e| e.typing.is_some()) {
+            self.typing_keys(&ctx);
+        } else {
+            self.editor_shortcuts(&ctx);
+        }
 
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.add_space(4.0);
@@ -154,6 +215,9 @@ impl SnippyApp {
                     for (style, label, tip) in RedactStyle::ALL {
                         ui.selectable_value(&mut self.settings.redact_style, style, label).on_hover_text(tip);
                     }
+                } else if matches!(self.settings.tool, Tool::Text | Tool::Step) {
+                    ui.color_edit_button_srgba(&mut self.settings.pen_color);
+                    ui.add(egui::Slider::new(&mut self.settings.text_size, 12.0..=120.0).text("Size"));
                 } else {
                     let color = if self.settings.tool == Tool::Highlighter { &mut self.settings.highlighter_color } else { &mut self.settings.pen_color };
                     ui.color_edit_button_srgba(color);
@@ -212,8 +276,14 @@ impl SnippyApp {
         });
 
         self.poll_find(&ctx);
-        let (tool, pen, hl, size, style) =
-            (self.settings.tool, self.settings.pen_color, self.settings.highlighter_color, self.settings.brush_size, self.settings.redact_style);
+        let (tool, pen, hl, size, style, text_size) = (
+            self.settings.tool,
+            self.settings.pen_color,
+            self.settings.highlighter_color,
+            self.settings.brush_size,
+            self.settings.redact_style,
+            self.settings.text_size,
+        );
         egui::CentralPanel::default().show(ui, |ui| {
             let Some(ed) = self.editor.as_mut() else { return };
             let (img_w, img_h) = (ed.image.width() as f32, ed.image.height() as f32);
@@ -235,27 +305,51 @@ impl SnippyApp {
                 let p = p.clamp(rect.min, rect.max);
                 ((p - rect.min) / scale).to_pos2()
             };
+            let next_step = ed.next_step();
             let new_ann = |p: Pos2| {
                 let (color, width) = match tool {
                     Tool::Highlighter => (hl, size * 3.0),
+                    Tool::Text => (pen, text_size),
+                    Tool::Step => (pen, text_size * 1.3),
                     _ => (pen, size),
                 };
                 let points = match tool {
-                    Tool::Pen | Tool::Highlighter => vec![p],
-                    Tool::Arrow | Tool::Rect | Tool::Redact => vec![p, p],
+                    Tool::Pen | Tool::Highlighter | Tool::Text => vec![p],
+                    Tool::Arrow | Tool::Rect | Tool::Redact | Tool::Step => vec![p, p],
                 };
-                Annotation { tool, points, color, width, style }
+                Annotation { tool, points, color, width, style, text: String::new(), number: next_step }
             };
 
-            if resp.drag_started() {
+            if tool == Tool::Text {
+                let at = if resp.clicked() {
+                    resp.interact_pointer_pos()
+                } else if resp.drag_started() {
+                    ctx.input(|i| i.pointer.press_origin())
+                } else {
+                    None
+                };
+                {
+                    if let Some(p) = at {
+                        // Finish any text being typed, start new text where clicked (the
+                        // click marks the middle of the first line's left edge).
+                        ed.commit_text();
+                        let p = to_px(p);
+                        ed.typing = Some(new_ann(Pos2::new(p.x, p.y - text_size * 0.6)));
+                    }
+                }
+            } else if resp.drag_started() {
                 if let Some(p) = ctx.input(|i| i.pointer.press_origin()) {
                     ed.active = Some(new_ann(to_px(p)));
                 }
-            } else if resp.clicked() && matches!(tool, Tool::Pen | Tool::Highlighter) {
-                // A single click leaves a dot.
+            } else if resp.clicked() && matches!(tool, Tool::Pen | Tool::Highlighter | Tool::Step) {
+                // A single click leaves a dot (pen) or a step marker.
                 if let Some(p) = resp.interact_pointer_pos() {
+                    let mut a = new_ann(to_px(p));
+                    if tool == Tool::Step {
+                        a.points.truncate(1);
+                    }
                     ed.checkpoint();
-                    ed.annotations.push(new_ann(to_px(p)));
+                    ed.annotations.push(a);
                 }
             }
             if resp.dragged() {
@@ -267,7 +361,8 @@ impl SnippyApp {
                                 a.points.push(p);
                             }
                         }
-                        Tool::Arrow | Tool::Rect | Tool::Redact => a.points[1] = p,
+                        Tool::Arrow | Tool::Rect | Tool::Redact | Tool::Step => a.points[1] = p,
+                        Tool::Text => {}
                     }
                 }
             }
@@ -293,6 +388,45 @@ impl SnippyApp {
                 let r = Rect::from_two_pos(rect.min + Vec2::new(r[0], r[1]) * scale, rect.min + Vec2::new(r[2], r[3]) * scale);
                 painter.rect_filled(r, 0.0, Color32::from_black_alpha(140));
                 painter.rect_stroke(r, 0.0, egui::Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Inside);
+            }
+            let to_screen = |p: Pos2| rect.min + p.to_vec2() * scale;
+            if let Some(a) = ed.active.as_ref().filter(|a| a.tool == Tool::Step) {
+                // Step being dragged: its circle and number (the arrow is drawn below).
+                let c = to_screen(a.points[0]);
+                let r = a.width / 2.0 * scale;
+                painter.circle(c, r, a.color, egui::Stroke::new((r / 8.0).max(1.0), Color32::WHITE));
+                let ink = if text::outline_for(a.color) == Color32::WHITE { Color32::WHITE } else { Color32::BLACK };
+                painter.text(c, egui::Align2::CENTER_CENTER, a.number.to_string(), egui::FontId::new(text::egui_size(a.width * 0.6) * scale, egui::FontFamily::Name(text::FAMILY.into())), ink);
+            }
+            if let Some(t) = &ed.typing {
+                // Text being typed: drawn live with the same font, with a caret and a box.
+                let font = egui::FontId::new(text::egui_size(t.width) * scale, egui::FontFamily::Name(text::FAMILY.into()));
+                let origin = to_screen(t.points[0]);
+                let shown = if t.text.is_empty() { " " } else { t.text.as_str() };
+                let (w, h) = text::measure(shown, t.width);
+                let outline = text::outline_for(t.color);
+                let job = |c: Color32| egui::text::LayoutJob::simple(shown.to_string(), font.clone(), c, f32::INFINITY);
+                let o = (t.width / 14.0).clamp(1.0, 6.0) * scale;
+                for (dx, dy) in [(-o, 0.0), (o, 0.0), (0.0, -o), (0.0, o), (-o, -o), (o, o), (-o, o), (o, -o)] {
+                    let g = ui.fonts_mut(|f| f.layout_job(job(outline)));
+                    painter.galley(origin + Vec2::new(dx, dy), g, outline);
+                }
+                let g = ui.fonts_mut(|f| f.layout_job(job(t.color)));
+                painter.galley(origin, g, t.color);
+                let bx = Rect::from_min_size(origin, Vec2::new(w.max(t.width * 0.3), h) * scale).expand(4.0);
+                painter.rect_stroke(bx, 2.0, egui::Stroke::new(1.0, ui.visuals().selection.stroke.color), egui::StrokeKind::Outside);
+                // Blinking caret at the end of the last line.
+                let blink = (ctx.input(|i| i.time) * 2.0) as i64 % 2 == 0;
+                if blink {
+                    let last = t.text.rsplit('\n').next().unwrap_or("");
+                    let lines = t.text.split('\n').count().max(1) as f32;
+                    let (lw, _) = text::measure(if last.is_empty() { "" } else { last }, t.width);
+                    let line_h = h / lines;
+                    let x = origin.x + lw * scale + 1.0;
+                    let y = origin.y + (lines - 1.0) * line_h * scale;
+                    painter.line_segment([Pos2::new(x, y), Pos2::new(x, y + line_h * scale)], egui::Stroke::new(1.5, t.color));
+                }
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
             }
             for ann in finished.iter().chain(ed.active.iter().filter(|a| a.tool != Tool::Redact)) {
                 let w = ann.width * scale;
@@ -351,6 +485,32 @@ impl SnippyApp {
         }
         if save {
             self.save_final();
+        }
+    }
+
+    /// Keyboard while typing text: characters go into the text; Enter finishes
+    /// (Shift+Enter: new line); Backspace deletes; Esc cancels.
+    fn typing_keys(&mut self, ctx: &egui::Context) {
+        let Some(ed) = self.editor.as_mut() else { return };
+        let events = ctx.input(|i| i.events.clone());
+        for e in events {
+            let Some(t) = ed.typing.as_mut() else { break };
+            match e {
+                egui::Event::Text(s) => t.text.push_str(&s),
+                egui::Event::Paste(s) => t.text.push_str(&s.replace("\r\n", "\n")),
+                egui::Event::Key { key: egui::Key::Enter, pressed: true, modifiers, .. } => {
+                    if modifiers.shift {
+                        t.text.push('\n');
+                    } else {
+                        ed.commit_text();
+                    }
+                }
+                egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => {
+                    t.text.pop();
+                }
+                egui::Event::Key { key: egui::Key::Escape, pressed: true, .. } => ed.typing = None,
+                _ => {}
+            }
         }
     }
 
@@ -424,15 +584,30 @@ impl SnippyApp {
 /// highlighter strokes at their real opacity instead of building up to solid colour.
 pub(crate) fn render_annotations(base: &RgbaImage, anns: &[Annotation]) -> RgbaImage {
     let mut out = base.clone();
-    let (w, h) = (out.width() as i32, out.height() as i32);
-
     for ann in anns {
-        if ann.tool == Tool::Redact {
-            // Applied to the image as it is at this point, so it also hides anything
-            // drawn before it.
-            crate::redact::apply(&mut out, ann.rect(), ann.style);
-            continue;
+        match ann.tool {
+            Tool::Redact => {
+                // Applied to the image as it is at this point, so it also hides anything
+                // drawn before it.
+                crate::redact::apply(&mut out, ann.rect(), ann.style);
+            }
+            Tool::Text => text::draw_text(&mut out, ann.points[0], &ann.text, ann.width, ann.color),
+            Tool::Step => {
+                if let Some(arrow) = ann.step_arrow() {
+                    draw_stroke(&mut out, &arrow);
+                }
+                text::draw_step(&mut out, ann.points[0], ann.number, ann.width, ann.color);
+            }
+            _ => draw_stroke(&mut out, ann),
         }
+    }
+    out
+}
+
+/// Rasterises one stroked annotation (pen, highlighter, arrow, box) onto `out`.
+fn draw_stroke(out: &mut RgbaImage, ann: &Annotation) {
+    let (w, h) = (out.width() as i32, out.height() as i32);
+    {
         let radius = (ann.width * 0.5).max(0.5);
         let lines = ann.polylines();
         let pad = radius + 1.0;
@@ -448,7 +623,7 @@ pub(crate) fn render_annotations(base: &RgbaImage, anns: &[Annotation]) -> RgbaI
         let bx1 = ((max.x + pad).ceil() as i32).min(w);
         let by1 = ((max.y + pad).ceil() as i32).min(h);
         if bx1 <= bx0 || by1 <= by0 {
-            continue;
+            return;
         }
         let bw = (bx1 - bx0) as usize;
         let mut cov = vec![0f32; bw * (by1 - by0) as usize];
@@ -491,7 +666,6 @@ pub(crate) fn render_annotations(base: &RgbaImage, anns: &[Annotation]) -> RgbaI
             *dst = Rgba([mix(sr, dst[0]), mix(sg, dst[1]), mix(sb, dst[2]), out_a]);
         }
     }
-    out
 }
 
 pub(crate) fn dist_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
@@ -518,6 +692,8 @@ mod tests {
             color: Color32::from_rgba_unmultiplied(0, 0, 0, 128),
             width: 10.0,
             style: RedactStyle::Pixelate,
+            text: String::new(),
+            number: 0,
         };
         let out = render_annotations(&solid(100, 40), &[ann]);
         let p = out.get_pixel(30, 20);

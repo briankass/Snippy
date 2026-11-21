@@ -1,6 +1,6 @@
 [package]
 name = "snippy"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 description = "A tiny floating screen snipping and recording tool"
 
@@ -19,6 +19,9 @@ raw-window-handle = "0.6"
 # Update checks against GitHub Releases
 ureq = { version = "3", features = ["json", "platform-verifier"] }
 serde_json = "1"
+# Text / step-number annotations (same crates egui already uses)
+ab_glyph = "0.2"
+epaint_default_fonts = "0.37"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

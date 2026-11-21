@@ -26,6 +26,7 @@ mod prefs;
 mod record;
 mod redact;
 mod scroll;
+mod text;
 mod tray;
 mod updater;
 mod util;
@@ -125,6 +126,8 @@ struct Settings {
     microphone: bool,
     tool: Tool,
     redact_style: redact::RedactStyle,
+    /// Text size / step-marker size (image pixels).
+    text_size: f32,
     pen_color: Color32,
     highlighter_color: Color32,
     brush_size: f32,
@@ -159,6 +162,7 @@ impl Default for Settings {
             microphone: false,
             tool: Tool::Pen,
             redact_style: redact::RedactStyle::default(),
+            text_size: 32.0,
             pen_color: Color32::from_rgb(230, 40, 40),
             highlighter_color: Color32::from_rgba_unmultiplied(255, 235, 50, 110),
             brush_size: 4.0,
@@ -252,6 +256,7 @@ impl SnippyApp {
         platform::refresh_startup_path();
         let (events_tx, events_rx) = mpsc::channel();
         hotkeys::install(&cc.egui_ctx, events_tx.clone());
+        text::register(&cc.egui_ctx);
         hotkeys::configure(settings.hotkey_print_screen, settings.hotkey_win_shift_s, settings.close_snipping_tool);
         let mut app = Self {
             phase: Phase::Bar,
@@ -644,6 +649,7 @@ impl SnippyApp {
             undo: Vec::new(),
             redo: Vec::new(),
             preview: None,
+            typing: None,
             find_rx: None,
         });
         self.phase = Phase::Editor;
@@ -1215,8 +1221,13 @@ fn main() -> eframe::Result<()> {
             let app = SnippyApp::new(cc);
             // The window was created at the default size; fit it to the saved settings.
             cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(bar::bar_size(&app.settings)));
+            let mut app = app;
             if app.bar_hidden() {
                 ghost_main(&cc.egui_ctx);
+            }
+            // For testing: open an image straight in the editor.
+            if let Some(img) = std::env::var_os("SNIPPY_OPEN_EDITOR").and_then(|p| image::open(p).ok()) {
+                app.show_editor(&cc.egui_ctx, img.to_rgba8());
             }
             Ok(Box::new(app))
         }),

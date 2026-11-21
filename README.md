@@ -17,7 +17,9 @@ executable: no installer, no runtime dependencies.
   monitors, Full screen asks which one); mixed display scaling is handled
 - Copied to the clipboard and auto-saved to `Pictures\Screenshots`
 - A flyout in the corner offers **Edit · Copy · Save as · Open folder**
-- Editor: pen, highlighter, arrow and box; undo / redo; save as PNG or JPEG
+- Editor: pen, highlighter, arrow, box, **text** and numbered **steps**; undo / redo; save
+  as PNG or JPEG. Text: click and type (Shift+Enter for a new line, Enter to finish).
+  Steps: click to place 1, 2, 3…, or drag to add an arrow to what the step points at
 - **Redact:** drag over anything private to pixelate, blur or black it out (black is the
   safest: nothing can be recovered). **Find personal info** hides email addresses, phone
   numbers and long numbers (card, account, order) automatically
@@ -90,7 +92,7 @@ In the selection overlay, **Esc** or **right-click** cancels.
 | Ctrl+Z / Ctrl+Y (or Ctrl+Shift+Z) | Undo / Redo |
 | Ctrl+C | Copy (with annotations) |
 | Ctrl+S | Save as… |
-| P / H / A / R / X | Pen / Highlighter / Arrow / Box / Redact |
+| P / H / A / R / T / N / X | Pen / Highlighter / Arrow / Box / Text / Step / Redact |
 
 ## Building
 
