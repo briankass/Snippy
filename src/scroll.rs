@@ -318,6 +318,69 @@ pub fn analyse(a: &[Sig], b: &[Sig], top: usize, bottom: usize, expect: Option<u
     (Shift::Lost, Some(info))
 }
 
+/// Percentage of detailed strip-rows that line up if the content moved by exactly `s`.
+pub fn match_at(a: &[Sig], b: &[Sig], top: usize, bottom: usize, s: usize) -> usize {
+    let h = a.len().min(b.len());
+    let (lo, hi) = (top, h.saturating_sub(bottom));
+    if s == 0 || hi <= lo + s {
+        return 0;
+    }
+    let (mut m, mut t) = (0usize, 0usize);
+    for r in lo..hi - s {
+        let (ra, rb) = (&a[r + s], &b[r]);
+        let mask = ra.strips | rb.strips;
+        let n = ra.n.min(rb.n) as usize;
+        for g in 0..STRIPS {
+            if mask & (1 << g) != 0 {
+                let rg = strip(n, g);
+                let len = rg.len().max(1) as u32;
+                t += 1;
+                m += (diff(ra, rb, rg) / len <= MATCH_TOL) as usize;
+            }
+        }
+    }
+    (m * 100).checked_div(t).unwrap_or(0)
+}
+
+/// Like `match_at`, but ignoring brightness and contrast: the percentage of detailed
+/// strip-rows whose *pattern* lines up (correlation ≥ 0.95). A page dimmed behind a pop-up,
+/// or under a translucent banner, still lines up this way.
+pub fn shape_match_at(a: &[Sig], b: &[Sig], top: usize, bottom: usize, s: usize) -> usize {
+    let h = a.len().min(b.len());
+    let (lo, hi) = (top, h.saturating_sub(bottom));
+    if hi <= lo + s + 8 {
+        return 0;
+    }
+    let (mut m, mut t) = (0usize, 0usize);
+    for r in lo..hi - s {
+        let (ra, rb) = (&a[r + s], &b[r]);
+        let mask = ra.strips & rb.strips;
+        let n = ra.n.min(rb.n) as usize;
+        for g in 0..STRIPS {
+            if mask & (1 << g) == 0 {
+                continue;
+            }
+            let rg = strip(n, g);
+            let len = rg.len().max(1) as f64;
+            let (xa, xb) = (&ra.bins[rg.clone()], &rb.bins[rg]);
+            let ma = xa.iter().map(|&v| v as f64).sum::<f64>() / len;
+            let mb = xb.iter().map(|&v| v as f64).sum::<f64>() / len;
+            let (mut sab, mut saa, mut sbb) = (0.0, 0.0, 0.0);
+            for (&x, &y) in xa.iter().zip(xb) {
+                let (dx, dy) = (x as f64 - ma, y as f64 - mb);
+                sab += dx * dy;
+                saa += dx * dx;
+                sbb += dy * dy;
+            }
+            t += 1;
+            if saa > 0.0 && sbb > 0.0 && sab / (saa * sbb).sqrt() >= 0.95 {
+                m += 1;
+            }
+        }
+    }
+    (m * 100).checked_div(t).unwrap_or(0)
+}
+
 /// Builds the tall image from successive frames.
 pub struct Stitcher {
     width: u32,
@@ -493,20 +556,45 @@ pub fn run(target: ScrollTarget, stop: Arc<AtomicBool>, progress: Arc<AtomicU32>
         // area's height (heavy pages can jump a long way), leaving no overlap. Look again,
         // then step back one notch at a time until the frames line up.
         let mut tries = 0;
-        while shift == Shift::Lost && tries < 14 && !stop.load(Ordering::Relaxed) {
+        let mut covered = false;
+        let mut net = 0i32; // notches scrolled while recovering
+        // Back up at most about four area-heights.
+        let core_h = h as usize - b.0 - b.1;
+        let back_limit = per_notch.map_or(6, |p| ((4 * core_h) as f64 / p.max(1.0)).ceil() as i32).clamp(4, 12);
+        while shift == Shift::Lost && tries < back_limit as usize + 4 && !stop.load(Ordering::Relaxed) {
             tries += 1;
-            let dir = if tries == 1 {
-                0 // just look again
+            // Is the page where we expected, but looking different? Then something covered
+            // or changed it (a pop-up, a cookie banner, an ad, the page dimming behind a
+            // dialog); scrolling back can't help.
+            // (Checked once, before backing up: afterwards "where expected" means nothing.)
+            if tries == 3 {
+                let e = expect.unwrap_or(0);
+                let plain = match_at(&prev_sig, &sig, b.0, b.1, e);
+                // (Pop-ups often stop the page scrolling, so also check "didn't move".)
+                let shape = shape_match_at(&prev_sig, &sig, b.0, b.1, e).max(shape_match_at(&prev_sig, &sig, b.0, b.1, 0));
+                if plain < 70 && (plain >= 20 || shape >= 60) {
+                    crate::diag::log(&format!(
+                        "scroll step {step}: page covered or changed (expected shift {e}: {plain}% match, {shape}% by pattern)"
+                    ));
+                    covered = true;
+                    break;
+                }
+            }
+            let dir = if tries <= 2 {
+                0 // look again (pop-ups and lazy content animate in)
             } else if matches!(find_shift(&sig, &prev_sig, b.0, b.1), Shift::By(_)) {
                 1 // we're above the previous frame: down a notch
-            } else {
+            } else if net > -back_limit {
                 -1 // past it: up a notch
+            } else {
+                break; // backed up far enough: give up
             };
             crate::diag::log(&format!("scroll step {step}: Lost (best {best:?}), recovering (try {tries}, scroll {dir})"));
             if dir == 0 {
-                std::thread::sleep(Duration::from_millis(400));
+                std::thread::sleep(Duration::from_millis(if tries == 1 { 400 } else { 900 }));
             } else {
                 input::scroll(center, dir);
+                net += dir;
             }
             frame = wait_until_still(&grab, &stop)?;
             sig = signatures(&frame);
@@ -514,6 +602,7 @@ pub fn run(target: ScrollTarget, stop: Arc<AtomicBool>, progress: Arc<AtomicU32>
             if shift == Shift::None && dir != 0 {
                 // back exactly where we were: go down a notch
                 input::scroll(center, 1);
+                net += 1;
                 frame = wait_until_still(&grab, &stop)?;
                 sig = signatures(&frame);
                 (shift, best) = analyse(&prev_sig, &sig, b.0, b.1, None);
@@ -521,6 +610,10 @@ pub fn run(target: ScrollTarget, stop: Arc<AtomicBool>, progress: Arc<AtomicU32>
             if matches!(shift, Shift::By(_)) {
                 notches = 1; // smaller steps from here on
             }
+        }
+        if shift == Shift::Lost && net < 0 {
+            // Put the page back where it was.
+            input::scroll(center, -net);
         }
         crate::diag::log(&format!(
             "scroll step {step}: {shift:?}, fixed bands top={} bottom={}, {notches} notches, best {best:?}",
@@ -556,7 +649,11 @@ pub fn run(target: ScrollTarget, stop: Arc<AtomicBool>, progress: Arc<AtomicU32>
                 }
             }
             Shift::Lost => {
-                notes.push("Stopped: the content changed in a way that couldn't be lined up (animation or video?)".into());
+                notes.push(if covered {
+                    "Stopped: something covered the page (a pop-up or ad?). Close it and try again".into()
+                } else {
+                    "Stopped: the page changed in a way that couldn't be lined up (a pop-up, or content loading?)".into()
+                });
                 break;
             }
         }
