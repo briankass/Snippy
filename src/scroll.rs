@@ -20,29 +20,73 @@ const SCROLLBAR_PX: u32 = 24;
 
 /// Number of column bins in a row signature.
 const BINS: usize = 128;
-/// Mean per-bin difference (0-255 luma) under which two rows count as the same.
-/// Browsers don't re-render scrolled content bit-for-bit identically (anti-aliasing,
-/// colour-managed images, fractional display scaling), so matching must be tolerant.
+/// Mean per-bin brightness difference (0-255 luma) under which two rows (or strips of
+/// rows) count as the same. Browsers don't re-render scrolled content bit-for-bit
+/// identically (anti-aliasing, colour management, fractional display scaling).
 const MATCH_TOL: u32 = 4;
-/// Tolerance for "this row didn't change at all" (sticky bands, end of page).
+/// Tolerance for "this didn't change at all" (sticky bands, end of page).
 const SAME_TOL: u32 = 2;
+/// Vertical strips a row is split into. Each strip works out the scroll on its own and
+/// the strips vote, so a strip that doesn't scroll or keeps changing (a sticky side
+/// column with ads, a floating video player) is simply outvoted.
+const STRIPS: usize = 8;
 
-/// Per-row fingerprint: the average brightness of `BINS` column bins, and whether the row
-/// is "informative" (has some detail; blank rows match anything, so they aren't evidence).
+/// Per-row fingerprint: the average brightness of up to `BINS` column bins, and which
+/// strips have some detail (blank strips match anything, so they aren't evidence).
 #[derive(Clone)]
 pub struct Sig {
     bins: [u8; BINS],
-    info: bool,
+    /// Bins in use (fewer than `BINS` only for very narrow areas).
+    n: u8,
+    /// Bit `g` set: strip `g` has detail.
+    strips: u8,
 }
 
-/// Total absolute per-bin difference between two rows (divide by `BINS` for the mean).
-fn dist(a: &Sig, b: &Sig) -> u32 {
-    a.bins.iter().zip(&b.bins).map(|(&x, &y)| x.abs_diff(y) as u32).sum::<u32>()
+/// Bin range of strip `g`.
+fn strip(n: usize, g: usize) -> std::ops::Range<usize> {
+    g * n / STRIPS..(g + 1) * n / STRIPS
 }
 
-/// `dist` within a mean per-bin tolerance.
+/// Total absolute per-bin difference over `range`.
+fn diff(a: &Sig, b: &Sig, range: std::ops::Range<usize>) -> u32 {
+    a.bins[range.clone()].iter().zip(&b.bins[range]).map(|(&x, &y)| x.abs_diff(y) as u32).sum()
+}
+
+/// Whole rows within a mean per-bin tolerance.
 fn within(a: &Sig, b: &Sig, tol: u32) -> bool {
-    dist(a, b) <= tol * BINS as u32
+    let n = a.n.min(b.n) as usize;
+    diff(a, b, 0..n) <= tol * n as u32
+}
+
+/// Evidence that the strips of `a` and `b` are unchanged: (unchanged rows, detailed rows)
+/// summed over the strips that are mostly unchanged, and the detailed rows of all strips.
+/// A strip counts as unchanged if 95 % of its detailed rows are. If at least half of the
+/// detailed strips are unchanged, everything counts as unchanged.
+fn unchanged_evidence(a: &[Sig], b: &[Sig]) -> (usize, usize) {
+    let mut same = [0usize; STRIPS];
+    let mut info = [0usize; STRIPS];
+    for (x, y) in a.iter().zip(b) {
+        let n = x.n.min(y.n) as usize;
+        let mask = x.strips | y.strips;
+        for g in 0..STRIPS {
+            if mask & (1 << g) != 0 {
+                let r = strip(n, g);
+                let len = r.len().max(1) as u32;
+                info[g] += 1;
+                same[g] += (diff(x, y, r) <= SAME_TOL * len) as usize;
+            }
+        }
+    }
+    let still: usize = (0..STRIPS).filter(|&g| info[g] > 0 && same[g] * 100 >= info[g] * 95).map(|g| info[g]).sum();
+    let total: usize = info.iter().sum();
+    // Also by strip count: at the end of a page with a busy sticky column (lots of detail,
+    // always changing) next to a quiet footer, the unchanged strips may hold less detail.
+    let detailed = (0..STRIPS).filter(|&g| info[g] >= 8).count();
+    let still_strips = (0..STRIPS).filter(|&g| info[g] >= 8 && same[g] * 100 >= info[g] * 95).count();
+    if detailed > 0 && still_strips * 2 >= detailed && still_strips >= 2 {
+        return (total, total);
+    }
+    (still, total)
 }
 
 pub fn signatures(img: &RgbaImage) -> Vec<Sig> {
@@ -50,7 +94,7 @@ pub fn signatures(img: &RgbaImage) -> Vec<Sig> {
     let core = if w > SCROLLBAR_PX as usize * 3 { w - SCROLLBAR_PX as usize } else { w };
     let raw = img.as_raw();
     let stride = w * 4;
-    let nb = BINS.min(core.max(1));
+    let nb = BINS.min(core.max(1)); // ≤ 128, fits in u8
     (0..img.height() as usize)
         .map(|y| {
             let row = &raw[y * stride..y * stride + core * 4];
@@ -63,8 +107,18 @@ pub fn signatures(img: &RgbaImage) -> Vec<Sig> {
                     .sum();
                 *bin = (sum / (c1 - c0) as u32) as u8;
             }
-            let (mn, mx) = bins[..nb].iter().fold((255u8, 0u8), |(a, b), &v| (a.min(v), b.max(v)));
-            Sig { bins, info: mx - mn >= 6 }
+            let detail = |r: std::ops::Range<usize>| {
+                let (mn, mx) = bins[r].iter().fold((255u8, 0u8), |(a, b), &v| (a.min(v), b.max(v)));
+                mx.saturating_sub(mn) >= 6
+            };
+            let mut strips = 0u8;
+            for g in 0..STRIPS {
+                let r = strip(nb, g);
+                if !r.is_empty() && detail(r) {
+                    strips |= 1 << g;
+                }
+            }
+            Sig { bins, n: nb as u8, strips }
         })
         .collect()
 }
@@ -105,11 +159,17 @@ pub struct Match {
     /// Average row difference at this shift, and at the best other shift.
     pub cost: f64,
     pub runner: f64,
+    /// Strips that agreed on this shift, of those with detail.
+    pub strips: (usize, usize),
 }
 
 impl std::fmt::Debug for Match {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "shift {} matched {}% of {} rows, cost {:.1} vs {:.1}", self.shift, self.percent, self.rows, self.cost, self.runner)
+        write!(
+            f,
+            "shift {} matched {}% of {} rows, cost {:.1} vs {:.1}, strips {}/{}",
+            self.shift, self.percent, self.rows, self.cost, self.runner, self.strips.0, self.strips.1
+        )
     }
 }
 
@@ -122,51 +182,124 @@ pub fn find_shift(a: &[Sig], b: &[Sig], top: usize, bottom: usize) -> Shift {
 ///
 /// `expect` is roughly how far the content should have moved (from earlier steps). It
 /// settles ambiguous cases, e.g. a smooth gradient that matches itself at many shifts.
+#[allow(clippy::needless_range_loop)] // tables indexed [shift][strip]
 pub fn analyse(a: &[Sig], b: &[Sig], top: usize, bottom: usize, expect: Option<usize>) -> (Shift, Option<Match>) {
     let h = a.len().min(b.len());
     let (lo, hi) = (top, h.saturating_sub(bottom));
     if hi <= lo + 16 {
         return (Shift::Lost, None);
     }
-    // Unchanged?
-    let (same, info) = (lo..hi).fold((0, 0), |(m, t), r| {
-        if a[r].info {
-            (m + within(&a[r], &b[r], SAME_TOL) as usize, t + 1)
-        } else {
-            (m, t)
-        }
-    });
-    if info == 0 || same * 100 >= info * 98 {
+    // Unchanged? (A playing video or animated ad can keep a strip changing.)
+    let (still, total) = unchanged_evidence(&a[lo..hi], &b[lo..hi]);
+    if total == 0 || still * 100 >= total * 60 {
         return (Shift::None, None);
     }
-    // Score every shift by its average (capped) row difference; capping keeps a changing
-    // region (an animated ad, a video) from swamping an otherwise perfect match.
+    // Per shift and strip: (matching rows, detailed rows, capped cost).
     let core = hi - lo;
-    // (shift, matches, rows, average cost)
-    let mut scores: Vec<(usize, usize, usize, f64)> = Vec::new();
-    for s in 1..core.saturating_sub(8) {
-        let (mut m, mut t, mut cost) = (0usize, 0usize, 0u64);
+    let max_s = core.saturating_sub(8);
+    let mut stats = vec![[(0u32, 0u32, 0u32); STRIPS]; max_s.max(1)];
+    for (s, st) in stats.iter_mut().enumerate().skip(1) {
         for r in lo..hi - s {
             let (ra, rb) = (&a[r + s], &b[r]);
-            if ra.info || rb.info {
-                let d = dist(ra, rb);
-                t += 1;
-                m += (d <= MATCH_TOL * BINS as u32) as usize;
-                cost += d.min(40 * BINS as u32) as u64;
+            let mask = ra.strips | rb.strips;
+            if mask == 0 {
+                continue;
+            }
+            let n = ra.n.min(rb.n) as usize;
+            for (g, e) in st.iter_mut().enumerate() {
+                if mask & (1 << g) != 0 {
+                    let rg = strip(n, g);
+                    let len = rg.len().max(1) as u32;
+                    let d = diff(ra, rb, rg) / len; // mean per-bin difference
+                    e.1 += 1;
+                    e.0 += (d <= MATCH_TOL) as u32;
+                    e.2 += d.min(40);
+                }
             }
         }
-        if t >= 24 {
-            scores.push((s, m, t, cost as f64 / (t * BINS) as f64));
+    }
+    // Scores (shift, matches, rows, average cost) over a set of strips; shifts compared on
+    // too few rows are left out (a handful of rows can match by chance).
+    let scores_for = |set: &[usize]| -> Vec<(usize, usize, usize, f64)> {
+        let sums: Vec<(usize, usize, usize, u64)> = (1..max_s)
+            .map(|s| {
+                let (m, t, c) = set.iter().fold((0usize, 0usize, 0u64), |(m, t, c), &g| {
+                    let e = stats[s][g];
+                    (m + e.0 as usize, t + e.1 as usize, c + e.2 as u64)
+                });
+                (s, m, t, c)
+            })
+            .collect();
+        // Evidence shrinks with the overlap; judge each shift against what its overlap
+        // could offer, and never trust a sliver of overlap.
+        let max_t = sums.iter().map(|x| x.2).max().unwrap_or(0);
+        sums.into_iter()
+            .filter(|x| core - x.0 >= core / 8 && x.2 >= 12.max(max_t * (core - x.0) / core / 3))
+            .map(|(s, m, t, c)| (s, m, t, c as f64 / t as f64))
+            .collect()
+    };
+    let lowest = |sc: &[(usize, usize, usize, f64)]| sc.iter().copied().min_by(|x, y| x.3.total_cmp(&y.3));
+    // Each strip lists the shifts it accepts (it lines up well there, nearly as well as at
+    // its best). A strip of text accepts one; a smooth gradient accepts many; a strip with
+    // a sticky column or a video accepts none. The shift most of the detail accepts wins.
+    let good_vs = |c0: f64, best: f64| c0 <= best * 1.6 + 1.5;
+    let mut accepts = vec![[0u32; STRIPS]; max_s.max(1)]; // weight per shift and strip
+    let mut detailed = 0;
+    for g in 0..STRIPS {
+        let sc = scores_for(&[g]);
+        let Some((_, _, _, best)) = lowest(&sc) else { continue };
+        detailed += 1;
+        for &(s, m, t, c) in &sc {
+            if good_vs(c, best) && m * 100 >= t * 70 {
+                accepts[s][g] = t as u32;
+            }
         }
     }
-    // Lowest average cost wins.
-    let Some(&(s, m, t, c)) = scores.iter().min_by(|x, y| x.3.total_cmp(&y.3)) else { return (Shift::Lost, None) };
+    // Weight of shift s: each strip accepting s (± 2 rows) counts with its evidence.
+    let weight = |s: usize| -> (usize, Vec<usize>) {
+        let (lo_s, hi_s) = (s.saturating_sub(2).max(1), (s + 2).min(max_s.saturating_sub(1)));
+        let mut w = 0;
+        let mut set = Vec::new();
+        for g in 0..STRIPS {
+            let best = (lo_s..=hi_s).map(|x| accepts[x][g]).max().unwrap_or(0);
+            if best > 0 {
+                w += best as usize;
+                set.push(g);
+            }
+        }
+        (w, set)
+    };
+    let weights: Vec<(usize, usize)> = (1..max_s).map(|s| (s, weight(s).0)).collect();
+    let max_w = weights.iter().map(|x| x.1).max().unwrap_or(0);
+    // Among the (near-)top shifts, prefer the expected one, else the first.
+    let top: Vec<usize> = weights.iter().filter(|x| x.1 > 0 && x.1 * 10 >= max_w * 9).map(|x| x.0).collect();
+    let chosen = match expect {
+        Some(e) => top.iter().copied().min_by_key(|s| s.abs_diff(e)),
+        None => top.first().copied(),
+    };
+    let agree: Vec<usize> = match chosen {
+        // The agreeing strips must carry a fair share of the area's detail.
+        // (compared with all the detail that overlaps at that shift)
+        Some(s) if max_w * 100 >= stats[s].iter().map(|e| e.1 as usize).sum::<usize>() * 30 => weight(s).1,
+        _ => {
+            let all: Vec<usize> = (0..STRIPS).collect();
+            let sc = scores_for(&all);
+            let info = lowest(&sc).map(|(s, m, t, c)| Match { shift: s, percent: m * 100 / t.max(1), rows: t, cost: c, runner: f64::NAN, strips: (0, detailed) });
+            return (Shift::Lost, info);
+        }
+    };
+    let scores = scores_for(&agree);
+    let near = chosen.unwrap_or(0);
+    let Some((s, m, t, c)) = lowest(&scores.iter().copied().filter(|x| x.0.abs_diff(near) <= 2).collect::<Vec<_>>()) else {
+        return (Shift::Lost, None);
+    };
     // It must also stand out: lines of text look alike, so a wrong shift can match a fair
     // share of rows. The real one is far better than any other (not neighbouring) shift.
-    let runner = scores.iter().filter(|x| x.0.abs_diff(s) > 4 && x.2 * 2 >= t).map(|x| x.3).fold(f64::INFINITY, f64::min);
+    let runner = scores.iter().filter(|x| x.0.abs_diff(s) > 4).map(|x| x.3).fold(f64::INFINITY, f64::min);
     let good = |c0: f64| c0 <= c * 1.6 + 1.5;
     let enough = |m: usize, t: usize| m * 100 >= t * 80 || (t >= 300 && m * 100 >= t * 70);
-    let info = Match { shift: s, percent: m * 100 / t, rows: t, cost: c, runner };
+    let strips = (agree.len(), detailed);
+    let info = Match { shift: s, percent: m * 100 / t, rows: t, cost: c, runner, strips };
     if !enough(m, t) {
         return (Shift::Lost, Some(info));
     }
@@ -175,13 +308,10 @@ pub fn analyse(a: &[Sig], b: &[Sig], top: usize, bottom: usize, expect: Option<u
     }
     // Ambiguous: take the good candidate closest to the expected shift, if it's near it.
     if let Some(e) = expect {
-        let pick = scores
-            .iter()
-            .filter(|x| good(x.3) && enough(x.1, x.2))
-            .min_by_key(|x| x.0.abs_diff(e));
+        let pick = scores.iter().filter(|x| good(x.3) && enough(x.1, x.2)).min_by_key(|x| x.0.abs_diff(e));
         if let Some(&(s2, m2, t2, c2)) = pick {
             if s2.abs_diff(e) <= e / 4 + 8 {
-                return (Shift::By(s2), Some(Match { shift: s2, percent: m2 * 100 / t2, rows: t2, cost: c2, runner }));
+                return (Shift::By(s2), Some(Match { shift: s2, percent: m2 * 100 / t2, rows: t2, cost: c2, runner, strips }));
             }
         }
     }
@@ -420,7 +550,8 @@ pub fn run(target: ScrollTarget, stop: Arc<AtomicBool>, progress: Arc<AtomicU32>
             }
             Shift::None => {
                 still += 1;
-                if still >= 2 {
+                // (Pages sometimes ignore a scroll; the end is three in a row.)
+                if still >= 3 {
                     break; // reached the end
                 }
             }
@@ -482,16 +613,11 @@ fn wait_until_still(grab: &dyn Fn() -> Result<RgbaImage, String>, stop: &AtomicB
     }
 }
 
-/// True if at least 75 % of the detailed rows are the same in both frames.
+/// True if most of the area (by detail) is unchanged; a strip with a playing video or
+/// animated ad may keep changing.
 fn mostly_unchanged(a: &[Sig], b: &[Sig]) -> bool {
-    let (same, info) = a.iter().zip(b).fold((0usize, 0usize), |(m, t), (x, y)| {
-        if x.info || y.info {
-            (m + within(x, y, SAME_TOL) as usize, t + 1)
-        } else {
-            (m, t)
-        }
-    });
-    info == 0 || same * 4 >= info * 3
+    let (still, total) = unchanged_evidence(a, b);
+    total == 0 || still * 100 >= total * 60
 }
 
 /// Pointer and wheel input.
@@ -622,6 +748,39 @@ mod tests {
         assert_eq!(shift, Shift::By(211), "{m:?}");
         // and noise alone doesn't count as movement
         assert_eq!(find_shift(&signatures(&a), &signatures(&noisy(&a, 3)), 0, 0), Shift::None);
+    }
+
+    /// Paints a fixed right-hand column (sticky ads / floating video) that changes per frame.
+    fn sticky_rail(img: &mut RgbaImage, frame: u32) {
+        let w = img.width();
+        for y in 0..img.height() {
+            for x in w * 3 / 4..w {
+                let v = ((x * 31 + y * 17 + frame * 97) % 256) as u8;
+                img.put_pixel(x, y, Rgba([v, v / 2, 255 - v, 255]));
+            }
+        }
+    }
+
+    #[test]
+    fn sticky_changing_side_column_does_not_spoil_matching() {
+        let p = page(480, 3000);
+        let mut a = view(&p, 0, 600, 0, 0);
+        let mut b = noisy(&view(&p, 233, 600, 0, 0), 5);
+        sticky_rail(&mut a, 0);
+        sticky_rail(&mut b, 1);
+        let (shift, m) = analyse(&signatures(&a), &signatures(&b), 0, 0, None);
+        assert_eq!(shift, Shift::By(233), "{m:?}");
+    }
+
+    #[test]
+    fn page_that_did_not_move_but_has_a_playing_video_is_still() {
+        let p = page(480, 3000);
+        let mut a = view(&p, 400, 600, 0, 0);
+        let mut b = noisy(&a, 9);
+        sticky_rail(&mut a, 0);
+        sticky_rail(&mut b, 1);
+        assert_eq!(find_shift(&signatures(&a), &signatures(&b), 0, 0), Shift::None);
+        assert!(mostly_unchanged(&signatures(&a), &signatures(&b)));
     }
 
     #[test]
