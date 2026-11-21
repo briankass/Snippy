@@ -24,6 +24,7 @@ mod pins;
 mod platform;
 mod prefs;
 mod record;
+mod redact;
 mod scroll;
 mod tray;
 mod updater;
@@ -123,6 +124,7 @@ struct Settings {
     system_audio: bool,
     microphone: bool,
     tool: Tool,
+    redact_style: redact::RedactStyle,
     pen_color: Color32,
     highlighter_color: Color32,
     brush_size: f32,
@@ -156,6 +158,7 @@ impl Default for Settings {
             system_audio: true,
             microphone: false,
             tool: Tool::Pen,
+            redact_style: redact::RedactStyle::default(),
             pen_color: Color32::from_rgb(230, 40, 40),
             highlighter_color: Color32::from_rgba_unmultiplied(255, 235, 50, 110),
             brush_size: 4.0,
@@ -640,6 +643,8 @@ impl SnippyApp {
             active: None,
             undo: Vec::new(),
             redo: Vec::new(),
+            preview: None,
+            find_rx: None,
         });
         self.phase = Phase::Editor;
 

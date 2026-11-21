@@ -18,6 +18,9 @@ executable: no installer, no runtime dependencies.
 - Copied to the clipboard and auto-saved to `Pictures\Screenshots`
 - A flyout in the corner offers **Edit · Copy · Save as · Open folder**
 - Editor: pen, highlighter, arrow and box; undo / redo; save as PNG or JPEG
+- **Redact:** drag over anything private to pixelate, blur or black it out (black is the
+  safest: nothing can be recovered). **Find personal info** hides email addresses, phone
+  numbers and long numbers (card, account, order) automatically
 
 **Text, colours, pins & history**
 - **Scrolling capture:** select the scrollable part of a window (e.g. a web page) and
@@ -87,7 +90,7 @@ In the selection overlay, **Esc** or **right-click** cancels.
 | Ctrl+Z / Ctrl+Y (or Ctrl+Shift+Z) | Undo / Redo |
 | Ctrl+C | Copy (with annotations) |
 | Ctrl+S | Save as… |
-| P / H / A / R | Pen / Highlighter / Arrow / Box |
+| P / H / A / R / X | Pen / Highlighter / Arrow / Box / Redact |
 
 ## Building
 

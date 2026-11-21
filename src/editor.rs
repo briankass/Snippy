@@ -1,4 +1,5 @@
 use super::*;
+use crate::redact::RedactStyle;
 
 // ───────────────────────────── Editor ─────────────────────────────
 //
@@ -10,14 +11,17 @@ pub(crate) enum Tool {
     Highlighter,
     Arrow,
     Rect,
+    /// Hide an area (pixelate / blur / black box).
+    Redact,
 }
 
 impl Tool {
-    const ALL: [(Tool, &'static str, &'static str); 4] = [
+    const ALL: [(Tool, &'static str, &'static str); 5] = [
         (Tool::Pen, "✏ Pen", "P"),
         (Tool::Highlighter, "🖍 Highlight", "H"),
         (Tool::Arrow, "➡ Arrow", "A"),
         (Tool::Rect, "⬜ Box", "R"),
+        (Tool::Redact, "▦ Redact", "X"),
     ];
 }
 
@@ -29,6 +33,20 @@ pub(crate) struct Annotation {
     pub(crate) points: Vec<Pos2>,
     pub(crate) color: Color32,
     pub(crate) width: f32,
+    /// Redact only: how the area is hidden.
+    pub(crate) style: RedactStyle,
+}
+
+impl Annotation {
+    /// A redaction of the area `r` (image pixels).
+    pub(crate) fn redaction(r: [f32; 4], style: RedactStyle) -> Self {
+        Annotation { tool: Tool::Redact, points: vec![Pos2::new(r[0], r[1]), Pos2::new(r[2], r[3])], color: Color32::BLACK, width: 1.0, style }
+    }
+
+    fn rect(&self) -> [f32; 4] {
+        let (a, b) = (self.points[0], *self.points.last().unwrap());
+        [a.x, a.y, b.x, b.y]
+    }
 }
 
 impl Annotation {
@@ -37,7 +55,7 @@ impl Annotation {
     pub(crate) fn polylines(&self) -> Vec<Vec<Pos2>> {
         match self.tool {
             Tool::Pen | Tool::Highlighter => vec![self.points.clone()],
-            Tool::Rect => {
+            Tool::Rect | Tool::Redact => {
                 let (a, b) = (self.points[0], *self.points.last().unwrap());
                 vec![vec![a, Pos2::new(b.x, a.y), b, Pos2::new(a.x, b.y), a]]
             }
@@ -65,6 +83,11 @@ pub(crate) struct Editor {
     pub(crate) active: Option<Annotation>,
     pub(crate) undo: Vec<Vec<Annotation>>,
     pub(crate) redo: Vec<Vec<Annotation>>,
+    /// While there are redactions: the rendered result (redactions can't be drawn as
+    /// shapes over the image), and the edit state it was rendered for.
+    pub(crate) preview: Option<(egui::TextureHandle, (usize, usize, usize))>,
+    /// "Find personal info" running in the background.
+    pub(crate) find_rx: Option<std::sync::mpsc::Receiver<Result<Vec<[f32; 4]>, String>>>,
 }
 
 impl Editor {
@@ -91,6 +114,24 @@ impl Editor {
     pub(crate) fn final_image(&self) -> RgbaImage {
         render_annotations(&self.image, &self.annotations)
     }
+
+    fn has_redactions(&self) -> bool {
+        self.annotations.iter().any(|a| a.tool == Tool::Redact)
+    }
+
+    /// Keeps the rendered preview in step with the annotations.
+    fn refresh_preview(&mut self, ctx: &egui::Context) {
+        if !self.has_redactions() {
+            self.preview = None;
+            return;
+        }
+        let key = (self.annotations.len(), self.undo.len(), self.redo.len());
+        if self.preview.as_ref().is_some_and(|(_, k)| *k == key) {
+            return;
+        }
+        let tex = image_to_texture(ctx, "editor-preview", &self.final_image());
+        self.preview = Some((tex, key));
+    }
 }
 
 impl SnippyApp {
@@ -109,9 +150,22 @@ impl SnippyApp {
                 for (tool, label, key) in Tool::ALL {
                     ui.selectable_value(&mut self.settings.tool, tool, label).on_hover_text(format!("Shortcut: {key}"));
                 }
-                let color = if self.settings.tool == Tool::Highlighter { &mut self.settings.highlighter_color } else { &mut self.settings.pen_color };
-                ui.color_edit_button_srgba(color);
-                ui.add(egui::Slider::new(&mut self.settings.brush_size, 1.0..=24.0).text("Size"));
+                if self.settings.tool == Tool::Redact {
+                    for (style, label, tip) in RedactStyle::ALL {
+                        ui.selectable_value(&mut self.settings.redact_style, style, label).on_hover_text(tip);
+                    }
+                } else {
+                    let color = if self.settings.tool == Tool::Highlighter { &mut self.settings.highlighter_color } else { &mut self.settings.pen_color };
+                    ui.color_edit_button_srgba(color);
+                    ui.add(egui::Slider::new(&mut self.settings.brush_size, 1.0..=24.0).text("Size"));
+                }
+                let finding = self.editor.as_ref().is_some_and(|e| e.find_rx.is_some());
+                let find = ui
+                    .add_enabled(!finding, egui::Button::new(if finding { "🔍 Looking…" } else { "🔍 Find personal info" }))
+                    .on_hover_text("Hide email addresses, phone numbers and long numbers (card, account, order) automatically");
+                if find.clicked() {
+                    self.find_personal_info(&ctx);
+                }
 
                 ui.separator();
                 let Some(ed) = self.editor.as_mut() else { return };
@@ -157,7 +211,9 @@ impl SnippyApp {
             });
         });
 
-        let (tool, pen, hl, size) = (self.settings.tool, self.settings.pen_color, self.settings.highlighter_color, self.settings.brush_size);
+        self.poll_find(&ctx);
+        let (tool, pen, hl, size, style) =
+            (self.settings.tool, self.settings.pen_color, self.settings.highlighter_color, self.settings.brush_size, self.settings.redact_style);
         egui::CentralPanel::default().show(ui, |ui| {
             let Some(ed) = self.editor.as_mut() else { return };
             let (img_w, img_h) = (ed.image.width() as f32, ed.image.height() as f32);
@@ -171,7 +227,9 @@ impl SnippyApp {
             let resp = resp.on_hover_cursor(egui::CursorIcon::Crosshair);
 
             ui.painter().rect_stroke(rect.expand(1.0), 0.0, ui.visuals().widgets.noninteractive.bg_stroke, egui::StrokeKind::Outside);
-            ui.painter().image(ed.texture.id(), rect, unit_uv(), Color32::WHITE);
+            ed.refresh_preview(&ctx);
+            let shown = ed.preview.as_ref().map_or(ed.texture.id(), |(t, _)| t.id());
+            ui.painter().image(shown, rect, unit_uv(), Color32::WHITE);
 
             let to_px = |p: Pos2| -> Pos2 {
                 let p = p.clamp(rect.min, rect.max);
@@ -184,9 +242,9 @@ impl SnippyApp {
                 };
                 let points = match tool {
                     Tool::Pen | Tool::Highlighter => vec![p],
-                    Tool::Arrow | Tool::Rect => vec![p, p],
+                    Tool::Arrow | Tool::Rect | Tool::Redact => vec![p, p],
                 };
-                Annotation { tool, points, color, width }
+                Annotation { tool, points, color, width, style }
             };
 
             if resp.drag_started() {
@@ -209,19 +267,34 @@ impl SnippyApp {
                                 a.points.push(p);
                             }
                         }
-                        Tool::Arrow | Tool::Rect => a.points[1] = p,
+                        Tool::Arrow | Tool::Rect | Tool::Redact => a.points[1] = p,
                     }
                 }
             }
             if resp.drag_stopped() {
                 if let Some(a) = ed.active.take() {
-                    ed.checkpoint();
-                    ed.annotations.push(a);
+                    let tiny = a.tool == Tool::Redact && {
+                        let r = a.rect();
+                        (r[2] - r[0]).abs() < 3.0 || (r[3] - r[1]).abs() < 3.0
+                    };
+                    if !tiny {
+                        ed.checkpoint();
+                        ed.annotations.push(a);
+                    }
                 }
             }
 
             let painter = ui.painter_at(rect);
-            for ann in ed.annotations.iter().chain(ed.active.iter()) {
+            // With redactions the preview already shows every finished annotation.
+            let finished: &[Annotation] = if ed.preview.is_some() { &[] } else { &ed.annotations };
+            if let Some(a) = ed.active.as_ref().filter(|a| a.tool == Tool::Redact) {
+                // Area being redacted: a hatched box until it's released.
+                let r = a.rect();
+                let r = Rect::from_two_pos(rect.min + Vec2::new(r[0], r[1]) * scale, rect.min + Vec2::new(r[2], r[3]) * scale);
+                painter.rect_filled(r, 0.0, Color32::from_black_alpha(140));
+                painter.rect_stroke(r, 0.0, egui::Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Inside);
+            }
+            for ann in finished.iter().chain(ed.active.iter().filter(|a| a.tool != Tool::Redact)) {
                 let w = ann.width * scale;
                 for line in ann.polylines() {
                     let pts: Vec<Pos2> = line.iter().map(|p| rect.min + p.to_vec2() * scale).collect();
@@ -281,6 +354,44 @@ impl SnippyApp {
         }
     }
 
+    /// Starts looking for personal details to hide (in the background).
+    pub(crate) fn find_personal_info(&mut self, ctx: &egui::Context) {
+        let Some(ed) = self.editor.as_mut() else { return };
+        // Look at the image as currently edited (so earlier redactions aren't re-found).
+        let img = ed.final_image();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let c = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::ocr::recognize_words(&img).map(|lines| crate::redact::find_sensitive(&lines)));
+            c.request_repaint();
+        });
+        ed.find_rx = Some(rx);
+        self.status = "Looking for personal info…".into();
+    }
+
+    fn poll_find(&mut self, _ctx: &egui::Context) {
+        let style = self.settings.redact_style;
+        let Some(ed) = self.editor.as_mut() else { return };
+        let Some(rx) = &ed.find_rx else { return };
+        let res = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("text recognition crashed".into()),
+        };
+        ed.find_rx = None;
+        self.status = match res {
+            Ok(rects) if rects.is_empty() => "No email addresses, phone numbers or long numbers found".into(),
+            Ok(rects) => {
+                ed.checkpoint();
+                let n = rects.len();
+                ed.annotations.extend(rects.into_iter().map(|r| Annotation::redaction(r, style)));
+                diag::log(&format!("editor: hid {n} item(s) of personal info"));
+                format!("Hid {n} item{} — check the result; Undo (Ctrl+Z) brings them back", if n == 1 { "" } else { "s" })
+            }
+            Err(e) => format!("Couldn't look for personal info: {e}"),
+        };
+    }
+
     pub(crate) fn copy_final(&mut self) {
         let Some(img) = self.editor.as_ref().map(Editor::final_image) else { return };
         self.status = match self.copy_to_clipboard(&img) {
@@ -316,6 +427,12 @@ pub(crate) fn render_annotations(base: &RgbaImage, anns: &[Annotation]) -> RgbaI
     let (w, h) = (out.width() as i32, out.height() as i32);
 
     for ann in anns {
+        if ann.tool == Tool::Redact {
+            // Applied to the image as it is at this point, so it also hides anything
+            // drawn before it.
+            crate::redact::apply(&mut out, ann.rect(), ann.style);
+            continue;
+        }
         let radius = (ann.width * 0.5).max(0.5);
         let lines = ann.polylines();
         let pad = radius + 1.0;
@@ -400,6 +517,7 @@ mod tests {
             points: (0..200).map(|i| Pos2::new(10.0 + (i % 50) as f32, 20.0)).collect(),
             color: Color32::from_rgba_unmultiplied(0, 0, 0, 128),
             width: 10.0,
+            style: RedactStyle::Pixelate,
         };
         let out = render_annotations(&solid(100, 40), &[ann]);
         let p = out.get_pixel(30, 20);
