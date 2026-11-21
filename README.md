@@ -40,7 +40,11 @@ executable: no installer, no runtime dependencies.
 - Record a region, a window or a full screen, on any monitor, to **MP4 (H.264 + AAC)**
 - **System audio** and/or **microphone**, mixed and kept in sync with the video
 - Countdown, pause / resume, red outline around the recorded area, mouse pointer in the video
-- Saved to `Videos\Snippy`; the flyout offers **Play · Save as · Delete · Open folder**
+- **GIF** button (video mode): record a silent, looping animated GIF instead, ideal for
+  chats and bug reports (up to 15 fps, scaled to at most 960 px; only what changes between
+  frames is stored, so still screens make tiny files)
+- Saved to `Videos\Snippy`; the flyout offers **Play · Copy · Save as · Delete · Open
+  folder**. Copy puts the file on the clipboard, ready to paste into a chat, email or folder
 - Uses Windows' built-in Media Foundation encoders (GPU-accelerated where available). On
   systems without Media Foundation (Windows "N" editions) it falls back to a software
   encoder, video only.
@@ -76,7 +80,8 @@ The floating bar, top to bottom:
 | Text scan | Copy text from an area of the screen |
 | Pipette | Pick a colour from the screen |
 | Camera | Switch between screenshot mode and video mode (red) |
-| Speaker / Mic | *(video mode)* record system audio / microphone |
+| GIF | *(video mode)* record an animated GIF instead of an MP4 video |
+| Speaker / Mic | *(video mode, MP4)* record system audio / microphone |
 | Timer | Delay (snips) or countdown (recordings): 0 → 3 → 5 → 10 s. Right-click resets |
 | Clock | Recent captures (history) |
 | Gear | Settings |

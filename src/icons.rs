@@ -41,6 +41,7 @@ pub enum Icon {
     Pipette,
     TextScan,
     ScrollCapture,
+    Gif,
 }
 
 /// Draws `icon` centred in `rect` (scaled to fit), in `color`.
@@ -90,6 +91,17 @@ pub fn draw(p: &Painter, icon: Icon, rect: Rect, color: Color32) {
             line(&[(15.0, 4.0), (20.0, 4.0), (20.0, 9.0)]);
             line(&[(20.0, 15.0), (20.0, 20.0), (15.0, 20.0)]);
             line(&[(9.0, 20.0), (4.0, 20.0), (4.0, 15.0)]);
+        }
+        Icon::Gif => {
+            rrect(1.5, 6.0, 22.5, 18.0, 2.5);
+            // G
+            arc(6.6, 12.0, 3.0, 40.0, 330.0);
+            line(&[(9.6, 12.0), (7.2, 12.0)]);
+            // I
+            line(&[(12.0, 9.0), (12.0, 15.0)]);
+            // F
+            line(&[(15.5, 15.0), (15.5, 9.0), (19.5, 9.0)]);
+            line(&[(15.5, 12.0), (18.5, 12.0)]);
         }
         Icon::Video => {
             rrect(2.5, 6.5, 15.0, 17.5, 2.5);

@@ -47,6 +47,8 @@ pub struct RecordOptions {
     pub microphone: bool,
     /// Draw the mouse pointer into the video.
     pub cursor: bool,
+    /// Animated GIF (no sound, at most `gifsink::MAX_FPS`) instead of MP4.
+    pub gif: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -223,7 +225,7 @@ fn run(target: RecordTarget, opts: RecordOptions, path: &Path, sh: Arc<Shared>) 
         std::thread::sleep(Duration::from_millis(30));
     }
 
-    let fps = opts.fps.max(1);
+    let fps = if opts.gif { opts.fps.clamp(1, crate::gifsink::MAX_FPS) } else { opts.fps.max(1) };
     let monitor = find_monitor(target.monitor_id)?;
     let (mon_x, mon_y) = (monitor.x().unwrap_or(0), monitor.y().unwrap_or(0));
     let cursor_scale = monitor.scale_factor().unwrap_or(1.0).max(1.0);
@@ -239,7 +241,7 @@ fn run(target: RecordTarget, opts: RecordOptions, path: &Path, sh: Arc<Shared>) 
     let mut notes = Vec::new();
 
     // Audio: open the devices first so we know whether the file needs an audio track.
-    let audio = if opts.system_audio || opts.microphone {
+    let audio = if !opts.gif && (opts.system_audio || opts.microphone) {
         start_audio(&opts, tx.clone(), sh.clone(), &mut notes)
     } else {
         None
@@ -498,6 +500,9 @@ pub fn make_thumbnail(img: &RgbaImage, max_w: u32) -> RgbaImage {
 type ReadyMsg = Result<(&'static str, bool, Option<String>), String>;
 
 fn open_sink(path: &Path, w: u32, h: u32, fps: u32, want_audio: bool) -> Result<(Box<dyn MediaSink>, Option<String>), String> {
+    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gif")) {
+        return Ok((Box::new(crate::gifsink::GifSink::new(path, w, h)?), None));
+    }
     #[cfg(windows)]
     let note = match crate::mf::MfSink::new(path, w, h, fps, want_audio) {
         Ok(s) => return Ok((Box::new(s), None)),
@@ -825,6 +830,37 @@ mod tests {
         let secs = mp4.duration().as_secs_f32();
         assert!((1.4..1.6).contains(&secs), "duration {secs}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Records the real screen to a GIF for ~2 s through the whole pipeline (needs a
+    /// display; something should be moving on it). `cargo test gif_recording_live -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gif_recording_live() {
+        let path = std::env::temp_dir().join(format!("snippy-live-{}.gif", std::process::id()));
+        let opts = RecordOptions { fps: 30, countdown: Duration::ZERO, system_audio: true, microphone: true, cursor: true, gif: true };
+        let rec = Recorder::start(RecordTarget { monitor_id: None, region: None }, opts, path.clone());
+        std::thread::sleep(Duration::from_millis(2500));
+        let info = rec.stop().unwrap();
+        println!("{info:?}");
+        assert_eq!(info.encoder, "GIF");
+        assert!(!info.has_audio, "GIFs have no sound");
+        let mut o = gif::DecodeOptions::new();
+        o.set_color_output(gif::ColorOutput::RGBA);
+        let mut dec = o.read_info(File::open(&path).unwrap()).unwrap();
+        let (w, h) = (dec.width(), dec.height());
+        let (mut frames, mut cs) = (0, 0u32);
+        while let Some(f) = dec.read_next_frame().unwrap() {
+            frames += 1;
+            cs += f.delay as u32;
+        }
+        println!("GIF {w}x{h}, {frames} frames, {:.2} s, {} KB", cs as f32 / 100.0, info.bytes / 1024);
+        assert!(w.max(h) <= 960);
+        assert!(frames >= 5, "frames: {frames}");
+        assert!((200..=300).contains(&cs), "duration {cs} cs");
+        if std::env::var_os("SNIPPY_KEEP").is_none() {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     #[test]

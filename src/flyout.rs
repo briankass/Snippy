@@ -283,6 +283,8 @@ impl Flyout {
                 ],
                 FlyoutKind::Recording(_) => vec![
                     (FlyoutAction::Play, Icon::Play, "Play".into()),
+                    // Puts the file itself on the clipboard: paste into a chat, an email or a folder.
+                    (FlyoutAction::Copy, Icon::Copy, "Copy".into()),
                     (FlyoutAction::SaveAs, Icon::Save, "Save as".into()),
                     (FlyoutAction::Delete, Icon::Trash, "Delete".into()),
                     (FlyoutAction::OpenFolder, Icon::Folder, String::new()),

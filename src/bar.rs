@@ -22,6 +22,7 @@ enum Item {
     Sep,
     Mode(CaptureMode),
     RecordToggle,
+    Gif,
     Speaker,
     Mic,
     Timer,
@@ -56,7 +57,10 @@ fn bar_items(s: &Settings) -> Vec<Item> {
     }
     v.extend([Item::Sep, Item::RecordToggle]);
     if s.record_mode {
-        v.extend([Item::Speaker, Item::Mic]);
+        v.push(Item::Gif);
+        if !s.record_gif {
+            v.extend([Item::Speaker, Item::Mic]); // GIFs have no sound
+        }
     }
     v.extend([Item::Timer, Item::Sep, Item::History, Item::Settings, Item::HideToTray]);
     v
@@ -192,6 +196,15 @@ impl SnippyApp {
                         if record { "Video mode (click for screenshots)".into() } else { "Screenshot mode (click for video)".into() },
                         record.then_some(REC_RED),
                     ),
+                    Item::Gif => (
+                        Icon::Gif,
+                        if self.settings.record_gif {
+                            "GIF: on (silent, loops; click for MP4 video)".into()
+                        } else {
+                            "GIF: off (click to record an animated GIF)".into()
+                        },
+                        self.settings.record_gif.then_some(Color32::from_white_alpha(30)),
+                    ),
                     Item::Speaker => (
                         if self.settings.system_audio { Icon::Speaker } else { Icon::SpeakerOff },
                         format!("System audio: {}", on_off(self.settings.system_audio)),
@@ -243,6 +256,10 @@ impl SnippyApp {
                         Item::RecordToggle => {
                             self.settings.record_mode = !record;
                             resize = true;
+                        }
+                        Item::Gif => {
+                            self.settings.record_gif ^= true;
+                            resize = true; // the sound buttons come and go
                         }
                         Item::Speaker => self.settings.system_audio ^= true,
                         Item::Mic => self.settings.microphone ^= true,

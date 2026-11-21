@@ -13,6 +13,7 @@ mod capture;
 mod diag;
 mod editor;
 mod flyout;
+mod gifsink;
 mod history;
 mod hotkeys;
 mod icons;
@@ -126,6 +127,8 @@ struct Settings {
     microphone: bool,
     tool: Tool,
     redact_style: redact::RedactStyle,
+    /// Record animated GIFs instead of MP4 videos.
+    record_gif: bool,
     /// Text size / step-marker size (image pixels).
     text_size: f32,
     pen_color: Color32,
@@ -162,6 +165,7 @@ impl Default for Settings {
             microphone: false,
             tool: Tool::Pen,
             redact_style: redact::RedactStyle::default(),
+            record_gif: false,
             text_size: 32.0,
             pen_color: Color32::from_rgb(230, 40, 40),
             highlighter_color: Color32::from_rgba_unmultiplied(255, 235, 50, 110),
@@ -789,6 +793,18 @@ impl SnippyApp {
                     self.show_editor(ctx, image);
                 }
             }
+            FlyoutAction::Copy if matches!(f.kind, FlyoutKind::Recording(_)) => {
+                if let Some(p) = f.path().map(|p| p.to_path_buf()) {
+                    let res = match self.clipboard.as_mut() {
+                        Some(c) => c.set().file_list(&[&p]).map_err(|e| e.to_string()),
+                        None => Err("clipboard unavailable".to_string()),
+                    };
+                    f.flash(match res {
+                        Ok(()) => "Copied: paste it into a chat, email or folder".to_string(),
+                        Err(e) => format!("Copy failed: {e}"),
+                    });
+                }
+            }
             FlyoutAction::Copy => {
                 if let Some(FlyoutKind::Snip { image, .. }) = self.flyout.as_ref().map(|f| &f.kind) {
                     let image = image.clone();
@@ -1051,17 +1067,20 @@ impl SnippyApp {
 impl SnippyApp {
     /// `border`: the recorded area in global points, to outline it on screen (None = full screen).
     fn begin_recording(&mut self, ctx: &egui::Context, target: RecordTarget, border: Option<platform::PxRect>) {
+        let gif = self.settings.record_gif;
         let opts = record::RecordOptions {
             fps: self.settings.fps.clamp(5, 60),
             countdown: Duration::from_secs(self.settings.delay_secs),
-            system_audio: self.settings.system_audio,
-            microphone: self.settings.microphone,
+            // GIFs have no sound.
+            system_audio: self.settings.system_audio && !gif,
+            microphone: self.settings.microphone && !gif,
             cursor: self.settings.show_cursor,
+            gif,
         };
         let dir = self.video_dir();
         let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join(format!("Recording {}.mp4", timestamp()));
-        diag::log("app: recording started");
+        let path = dir.join(format!("Recording {}.{}", timestamp(), if gif { "gif" } else { "mp4" }));
+        diag::log(&format!("app: recording started ({})", if gif { "GIF" } else { "MP4" }));
         let recorder = Recorder::start(target, opts, path);
         self.phase = Phase::Recording { recorder, border };
         self.restore_main(ctx);

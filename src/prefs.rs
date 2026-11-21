@@ -252,6 +252,15 @@ impl SnippyApp {
 
         // ── Recording
         section(ui, "Recording", |ui| {
+            let gif_before = self.settings.record_gif;
+            row(ui, Icon::Gif, "Record as GIF", "Animated GIF: silent, loops, easy to paste into chats (max 15 fps, 960 px). Also on the bar in video mode", |ui| {
+                toggle(ui, &mut self.settings.record_gif);
+            });
+            if self.settings.record_gif != gif_before && matches!(self.phase, Phase::Bar) && !self.bar_hidden() && self.settings.record_mode {
+                // The bar's sound buttons come and go (this is the settings window: aim
+                // the resize at the main window).
+                ui.ctx().send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::InnerSize(crate::bar::bar_size(&self.settings)));
+            }
             row(ui, Icon::Video, "Frame rate", "Higher is smoother but makes bigger files", |ui| {
                 for fps in [60, 30, 15] {
                     ui.selectable_value(&mut self.settings.fps, fps, format!("{fps} fps"));
